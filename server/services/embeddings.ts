@@ -19,18 +19,87 @@ export function hashText(text: string): string {
   return createHash('sha256').update(text).digest('hex')
 }
 
-export function cosineSimilarity(a: number[], b: number[]): number {
+export function cosineSimilarity(a: number[] | Float32Array, b: number[] | Float32Array): number {
   if (a.length === 0 || b.length === 0 || a.length !== b.length) return 0
   let dot = 0
   let na = 0
   let nb = 0
   for (let i = 0; i < a.length; i++) {
-    dot += a[i]! * b[i]!
-    na += a[i]! * a[i]!
-    nb += b[i]! * b[i]!
+    const ai = a[i]!
+    const bi = b[i]!
+    dot += ai * bi
+    na += ai * ai
+    nb += bi * bi
   }
   if (na === 0 || nb === 0) return 0
   return dot / (Math.sqrt(na) * Math.sqrt(nb))
+}
+
+type CachedVec = {
+  object_type: EmbeddingObjectType
+  object_id: string
+  vector: Float32Array
+}
+
+/** Caché en proceso: evita JSON.parse de todos los vectores por query. */
+const vectorCache = new Map<string, CachedVec[]>()
+
+function cacheKey(model: string, types?: EmbeddingObjectType[]): string {
+  const t = types?.length ? [...types].sort().join(',') : '*'
+  return `${model}::${t}`
+}
+
+function invalidateVectorCache(): void {
+  vectorCache.clear()
+}
+
+function parseVector(raw: string): Float32Array | null {
+  try {
+    const arr = JSON.parse(raw) as number[]
+    if (!Array.isArray(arr) || arr.length === 0) return null
+    return Float32Array.from(arr)
+  } catch {
+    return null
+  }
+}
+
+function loadVectorPartition(
+  model: string,
+  types?: EmbeddingObjectType[],
+): CachedVec[] {
+  const key = cacheKey(model, types)
+  const hit = vectorCache.get(key)
+  if (hit) return hit
+
+  const db = getDb()
+  let embRows: EmbeddingRow[]
+  if (types && types.length > 0) {
+    const placeholders = types.map(() => '?').join(',')
+    embRows = rows<EmbeddingRow>(
+      db
+        .prepare(
+          `SELECT * FROM embeddings WHERE object_type IN (${placeholders}) AND model = ?`,
+        )
+        .all(...types, model),
+    )
+  } else {
+    embRows = rows<EmbeddingRow>(
+      db.prepare(`SELECT * FROM embeddings WHERE model = ?`).all(model),
+    )
+  }
+
+  const cached: CachedVec[] = []
+  for (const r of embRows) {
+    const vector = parseVector(r.vector)
+    if (!vector) continue
+    cached.push({
+      object_type: r.object_type,
+      object_id: r.object_id,
+      vector,
+    })
+  }
+  vectorCache.set(key, cached)
+  return cached
 }
 
 async function embedTexts(
@@ -41,8 +110,11 @@ async function embedTexts(
   const model = env('COHERE_EMBED_MODEL', 'embed-v4.0')
   if (!apiKey || texts.length === 0) return null
 
-  const delayMs = Number(env('COHERE_REQUEST_DELAY_MS', '2000')) || 0
-  if (delayMs > 0) await delay(delayMs)
+  // Delay solo para indexación/batch — nunca en search_query (typeahead/Ir).
+  if (inputType === 'search_document') {
+    const delayMs = Number(env('COHERE_REQUEST_DELAY_MS', '2000')) || 0
+    if (delayMs > 0) await delay(delayMs)
+  }
 
   try {
     const res = await fetch('https://api.cohere.com/v2/embed', {
@@ -140,8 +212,20 @@ export async function upsertEmbedding(
     )
   }
 
+  invalidateVectorCache()
   console.log(`[mnemosyne] embedded ${objectType}/${objectId} (${vector.length}d)`)
   return true
+}
+
+export function deleteEmbedding(
+  objectType: EmbeddingObjectType,
+  objectId: string,
+): void {
+  const db = getDb()
+  db.prepare(
+    `DELETE FROM embeddings WHERE object_type = ? AND object_id = ?`,
+  ).run(objectType, objectId)
+  invalidateVectorCache()
 }
 
 export async function searchSimilar(
@@ -159,49 +243,61 @@ export async function searchSimilar(
   const result = await embedTexts([query], 'search_query')
   if (!result || !result.vectors[0]) return []
 
-  const queryVec = result.vectors[0]
-  const db = getDb()
-  let embRows: EmbeddingRow[]
-  if (types && types.length > 0) {
-    const placeholders = types.map(() => '?').join(',')
-    embRows = rows<EmbeddingRow>(
-      db
-        .prepare(
-          `SELECT * FROM embeddings WHERE object_type IN (${placeholders}) AND model = ?`,
-        )
-        .all(...types, result.model),
-    )
-  } else {
-    embRows = rows<EmbeddingRow>(
-      db.prepare(`SELECT * FROM embeddings WHERE model = ?`).all(result.model),
-    )
-  }
+  const queryVec = Float32Array.from(result.vectors[0])
+  const partition = loadVectorPartition(result.model, types)
 
-  const scored = embRows
-    .map((r) => {
-      let vec: number[] = []
-      try {
-        vec = JSON.parse(r.vector) as number[]
-      } catch {
-        return null
-      }
-      return {
-        object_type: r.object_type,
-        object_id: r.object_id,
-        score: cosineSimilarity(queryVec, vec),
-      }
-    })
-    .filter(
-      (r): r is { object_type: EmbeddingObjectType; object_id: string; score: number } =>
-        r !== null,
-    )
+  const scored = partition
+    .map((r) => ({
+      object_type: r.object_type,
+      object_id: r.object_id,
+      score: cosineSimilarity(queryVec, r.vector),
+    }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
 
   return scored
 }
 
-/** Embed entry + sus quántomos reconocidos (post-Aduana). */
+/** Parte texto largo en chunks con overlap para Embed v4. */
+export function chunkForEmbed(
+  text: string,
+  maxChars = 1100,
+  overlap = 140,
+): string[] {
+  const clean = text.replace(/\r\n/g, '\n').trim()
+  if (!clean) return []
+  if (clean.length <= maxChars) return [clean]
+
+  const paras = clean.split(/\n\s*\n/)
+  const packed: string[] = []
+  let buf = ''
+  for (const p of paras) {
+    const next = buf ? `${buf}\n\n${p}` : p
+    if (next.length > maxChars && buf) {
+      packed.push(buf.trim())
+      const tail = buf.slice(Math.max(0, buf.length - overlap))
+      buf = `${tail}\n\n${p}`
+    } else {
+      buf = next
+    }
+  }
+  if (buf.trim()) packed.push(buf.trim())
+
+  const out: string[] = []
+  const step = Math.max(maxChars - overlap, 200)
+  for (const c of packed) {
+    if (c.length <= maxChars) {
+      out.push(c)
+      continue
+    }
+    for (let i = 0; i < c.length; i += step) {
+      out.push(c.slice(i, i + maxChars))
+    }
+  }
+  return out
+}
+
+/** Embed entry + chunks + quántomos reconocidos (post-Aduana). */
 export async function embedApprovedEntry(entryId: string): Promise<void> {
   const db = getDb()
   const entry = row<{ id: string; title: string; content_raw: string | null }>(
@@ -209,8 +305,20 @@ export async function embedApprovedEntry(entryId: string): Promise<void> {
   )
   if (!entry) return
 
-  const entryText = [entry.title, entry.content_raw ?? ''].filter(Boolean).join('\n\n')
-  await upsertEmbedding('entry', entry.id, entryText)
+  const raw = entry.content_raw ?? ''
+  const chunks = chunkForEmbed(raw)
+  const head = [entry.title, chunks[0] ?? raw].filter(Boolean).join('\n\n')
+  await upsertEmbedding('entry', entry.id, head)
+
+  db.prepare(
+    `DELETE FROM embeddings WHERE object_type = 'entry_chunk' AND object_id LIKE ?`,
+  ).run(`${entry.id}:%`)
+
+  if (chunks.length > 1) {
+    for (let i = 0; i < chunks.length; i++) {
+      await upsertEmbedding('entry_chunk', `${entry.id}:${i}`, chunks[i]!)
+    }
+  }
 
   const quantomos = rows<{ id: string; title: string; content: string | null }>(
     db

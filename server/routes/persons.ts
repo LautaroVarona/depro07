@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { randomUUID } from 'node:crypto'
-import { getDb, syncPersonAliases } from '../db.js'
+import { getDb, syncPersonAliases, removePersonFts } from '../db.js'
 import { row, rowRequired, rows } from '../sql.js'
 import type {
   EntityLink,
@@ -14,7 +14,7 @@ import {
   embedPerson,
   enqueueEmbed,
 } from '../services/embeddings.js'
-import { liveSuggestedMatch } from '../services/entityMatch.js'
+import { liveSuggestedMatch, expandMentionContext } from '../services/entityMatch.js'
 import {
   isProfileKind,
   normalizePersonKind,
@@ -30,7 +30,7 @@ import {
   normalizeRelationType,
 } from '../services/entityRelations.js'
 import { searchSimilar } from '../services/embeddings.js'
-import { stringSimilarity, normalizeName } from '../services/entityMatch.js'
+import { typeaheadEntities } from '../services/typeahead.js'
 import { dismissGraphLinkSuggestion } from '../services/graph.js'
 
 export const personsRouter = Router()
@@ -114,6 +114,14 @@ personsRouter.get('/', (_req, res) => {
 
   const waiting = buildWaitingWithMatches(db)
   const operator_id = getOperatorId(db)
+  const pending_proposals_count = rowRequired<{ c: number }>(
+    db
+      .prepare(
+        `SELECT COUNT(*) as c FROM entity_proposals
+         WHERE kind = 'person' AND status = 'pending'`,
+      )
+      .get(),
+  ).c
 
   // Compat: persons = perfiles maestros (prioridad)
   res.json({
@@ -122,6 +130,7 @@ personsRouter.get('/', (_req, res) => {
     persons: profiles,
     waiting_count: waiting.length,
     profile_count: profiles.length,
+    pending_proposals_count,
     operator_id,
   })
 })
@@ -141,14 +150,23 @@ personsRouter.get('/pending', (_req, res) => {
   const roster = listMasterProfiles(db)
 
   const getEntry = db.prepare(
-    `SELECT id, title, status FROM entries WHERE id = ?`,
+    `SELECT id, title, status, content_raw, source_type, original_filename
+     FROM entries WHERE id = ?`,
   )
 
   res.json({
     proposals: proposals.map((p) => {
-      const entry = row<Pick<Entry, 'id' | 'title' | 'status'>>(
-        getEntry.get(p.entry_id),
-      )
+      const entry = row<
+        Pick<
+          Entry,
+          | 'id'
+          | 'title'
+          | 'status'
+          | 'content_raw'
+          | 'source_type'
+          | 'original_filename'
+        >
+      >(getEntry.get(p.entry_id))
       const meta = parseMeta(p.suggested_meta)
       if (meta.kind === 'agrupacion' || meta.kind === 'ficticio') {
         meta.kind = 'ficticia'
@@ -180,11 +198,28 @@ personsRouter.get('/pending', (_req, res) => {
         suggested_match = liveSuggestedMatch(p.suggested_name, roster)
       }
 
+      const evidence_parsed = parseEvidence(p.evidence)
+      const context = expandMentionContext(
+        entry?.content_raw,
+        p.suggested_name,
+      )
+
       return {
         ...p,
         meta,
-        evidence_parsed: parseEvidence(p.evidence),
-        entry: entry ?? null,
+        evidence_parsed: {
+          ...evidence_parsed,
+          context: context || evidence_parsed.snippet || '',
+        },
+        entry: entry
+          ? {
+              id: entry.id,
+              title: entry.title,
+              status: entry.status,
+              source_type: entry.source_type,
+              original_filename: entry.original_filename,
+            }
+          : null,
         suggested_match,
       }
     }),
@@ -312,42 +347,51 @@ personsRouter.get('/search', async (req, res) => {
     return
   }
 
-  const db = getDb()
-  const masters = listMasterProfiles(db)
-  const byId = new Map(masters.map((p) => [p.id, p]))
+  const mode = String(req.query.mode ?? 'lexical').toLowerCase()
+  const lexical = typeaheadEntities(q, {
+    kinds: ['person'],
+    limit: 30,
+    scope: 'masters',
+  })
   const scores = new Map<string, number>()
+  for (const hit of lexical) scores.set(hit.id, hit.score)
 
-  // Fuzzy local (nombre + aliases) siempre disponible
-  const qNorm = normalizeName(q)
-  for (const p of masters) {
-    let best = stringSimilarity(qNorm, normalizeName(p.name))
+  if (mode === 'semantic' || mode === 'hybrid') {
     try {
-      const aliases = JSON.parse(p.aliases || '[]') as string[]
-      for (const a of aliases) {
-        best = Math.max(best, stringSimilarity(qNorm, normalizeName(a)))
+      const similar = await searchSimilar(q, { types: ['person'], limit: 40 })
+      const masters = new Set(listMasterProfiles(getDb()).map((p) => p.id))
+      for (const hit of similar) {
+        if (!masters.has(hit.object_id)) continue
+        const prev = scores.get(hit.object_id) ?? 0
+        scores.set(hit.object_id, Math.max(prev, hit.score))
       }
-    } catch {
-      /* ignore */
+    } catch (err) {
+      console.warn('[persons/search] embedding fallback:', err)
     }
-    if (best >= 0.35) scores.set(p.id, best)
   }
 
-  // Semántica via embeddings (si hay API / vectores)
-  try {
-    const similar = await searchSimilar(q, { types: ['person'], limit: 40 })
-    for (const hit of similar) {
-      if (!byId.has(hit.object_id)) continue
-      const prev = scores.get(hit.object_id) ?? 0
-      // prioriza embedding cuando aporta señal
-      scores.set(hit.object_id, Math.max(prev, hit.score))
-    }
-  } catch (err) {
-    console.warn('[persons/search] embedding fallback:', err)
-  }
+  const db = getDb()
+  const ids = [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30)
+    .map(([id]) => id)
 
-  const results = [...scores.entries()]
-    .map(([id, score]) => {
-      const p = byId.get(id)!
+  const results = ids
+    .map((id) => {
+      const lex = lexical.find((h) => h.id === id)
+      if (lex) {
+        return {
+          id: lex.id,
+          name: lex.label,
+          kind: lex.subtitle,
+          aliases_list: lex.aliases,
+          score: Math.round((scores.get(id) ?? lex.score) * 1000) / 1000,
+        }
+      }
+      const p = row<Person>(
+        db.prepare(`SELECT * FROM persons WHERE id = ?`).get(id),
+      )
+      if (!p) return null
       let aliases_list: string[] = []
       try {
         aliases_list = JSON.parse(p.aliases || '[]') as string[]
@@ -360,11 +404,10 @@ personsRouter.get('/search', async (req, res) => {
         kind: normalizePersonKind(p.kind),
         aliases_list,
         is_operator: !!p.is_operator,
-        score: Math.round(score * 1000) / 1000,
+        score: Math.round((scores.get(id) ?? 0) * 1000) / 1000,
       }
     })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 30)
+    .filter((x): x is NonNullable<typeof x> => x !== null)
 
   res.json({ query: q, results })
 })
@@ -627,6 +670,32 @@ personsRouter.post('/:id/attach', (req, res) => {
       `UPDATE entity_links SET entity_id = ?
        WHERE entity_kind = 'person' AND entity_id = ?`,
     ).run(master.id, waiting.id)
+
+    // Reasignar membresías de agrupaciones (evitar duplicados si el maestro ya está)
+    const waitingMemberships = rows<{ id: string; agrupacion_id: string }>(
+      db
+        .prepare(
+          `SELECT id, agrupacion_id FROM agrupacion_members WHERE person_id = ?`,
+        )
+        .all(waiting.id),
+    )
+    for (const m of waitingMemberships) {
+      const already = row<{ id: string }>(
+        db
+          .prepare(
+            `SELECT id FROM agrupacion_members
+             WHERE agrupacion_id = ? AND person_id = ?`,
+          )
+          .get(m.agrupacion_id, master.id),
+      )
+      if (already) {
+        db.prepare(`DELETE FROM agrupacion_members WHERE id = ?`).run(m.id)
+      } else {
+        db.prepare(
+          `UPDATE agrupacion_members SET person_id = ? WHERE id = ?`,
+        ).run(master.id, m.id)
+      }
+    }
 
     db.prepare(
       `UPDATE persons SET status = 'merged', merged_into = ?, updated_at = ?
@@ -951,9 +1020,13 @@ personsRouter.delete('/:id', (req, res) => {
     db.prepare(`DELETE FROM entity_aliases WHERE person_id = ?`).run(
       existing.id,
     )
+    removePersonFts(existing.id)
     db.prepare(
       `DELETE FROM embeddings WHERE object_type = 'person' AND object_id = ?`,
     ).run(existing.id)
+    db.prepare(`DELETE FROM agrupacion_members WHERE person_id = ?`).run(
+      existing.id,
+    )
     db.prepare(`DELETE FROM persons WHERE id = ?`).run(existing.id)
     db.exec('COMMIT')
   } catch (err) {

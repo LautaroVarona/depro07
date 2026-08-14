@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type ProposalBundle } from '../services/api'
+import { AudioCribaPanel } from './AudioCribaPanel'
 
 interface Props {
   refreshKey: number
@@ -24,6 +25,8 @@ function fromDatetimeLocal(value: string): string {
 
 export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
   const [proposals, setProposals] = useState<ProposalBundle[]>([])
+  const [cribaCount, setCribaCount] = useState(0)
+  const [tab, setTab] = useState<'criba' | 'review'>('criba')
   const [live, setLive] = useState<LiveStatus | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -43,17 +46,38 @@ export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
   const transcriptRef = useRef<HTMLPreElement>(null)
   const prevLen = useRef(0)
   const lastDoneKey = useRef<string | null>(null)
+  const proposalsInFlight = useRef(false)
+  const liveInFlight = useRef(false)
+  const liveRunningRef = useRef(false)
 
   const loadProposals = useCallback(async () => {
+    if (proposalsInFlight.current) return
+    proposalsInFlight.current = true
     setLoading(true)
     setError(null)
     try {
-      const data = await api.getPendingProposals()
+      const [data, criba] = await Promise.all([
+        api.getPendingProposals(),
+        api.getCribaAudios().catch(() => ({ entries: [] })),
+      ])
       setProposals(data.proposals)
+      setCribaCount(criba.entries.length)
+      setTab((prev) => {
+        if (prev === 'criba' && criba.entries.length === 0 && data.proposals.length > 0) {
+          return 'review'
+        }
+        if (prev === 'review' && data.proposals.length === 0 && criba.entries.length > 0) {
+          return 'criba'
+        }
+        if (criba.entries.length > 0 && data.proposals.length === 0) return 'criba'
+        return prev
+      })
 
-      if (data.proposals.length === 0) {
+      if (data.proposals.length === 0 && criba.entries.length === 0) {
         setActiveId(null)
         onEmpty()
+      } else if (data.proposals.length === 0) {
+        setActiveId(null)
       } else {
         setActiveId((prev) =>
           prev && data.proposals.some((p) => p.id === prev)
@@ -105,12 +129,19 @@ export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
       setError(err instanceof Error ? err.message : 'Error al cargar aduana')
     } finally {
       setLoading(false)
+      proposalsInFlight.current = false
     }
   }, [onEmpty])
 
   const pollLive = useCallback(async () => {
+    if (liveInFlight.current) return
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return
+    }
+    liveInFlight.current = true
     try {
       const status = await api.getPipelineStatus()
+      liveRunningRef.current = Boolean(status.running && !status.paused)
       setLive(status)
       // Cuando llega una nueva entry a pending_review, refrescar propuestas
       if (status.stage === 'done' || (!status.running && status.stage === 'idle')) {
@@ -118,6 +149,8 @@ export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
       }
     } catch {
       /* ignore */
+    } finally {
+      liveInFlight.current = false
     }
   }, [])
 
@@ -126,14 +159,31 @@ export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
   }, [loadProposals, refreshKey])
 
   useEffect(() => {
-    const id = window.setInterval(() => void loadProposals(), 4000)
+    const id = window.setInterval(() => void loadProposals(), 5000)
     return () => window.clearInterval(id)
   }, [loadProposals])
 
   useEffect(() => {
-    void pollLive()
-    const id = window.setInterval(() => void pollLive(), 800)
-    return () => window.clearInterval(id)
+    let cancelled = false
+    let timer = 0
+
+    const schedule = () => {
+      const delay = liveRunningRef.current ? 1500 : 4000
+      timer = window.setTimeout(async () => {
+        if (cancelled) return
+        await pollLive()
+        if (!cancelled) schedule()
+      }, delay)
+    }
+
+    void pollLive().then(() => {
+      if (!cancelled) schedule()
+    })
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
   }, [pollLive])
 
   // Auto-scroll transcript live
@@ -260,6 +310,22 @@ export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
       <header className="customs-toolbar">
         <div className="customs-toolbar-left">
           <h2>Aduana</h2>
+          <div className="criba-stage-tabs aduana-tabs">
+            <button
+              type="button"
+              className={tab === 'criba' ? 'criba-stage-tab is-active' : 'criba-stage-tab'}
+              onClick={() => setTab('criba')}
+            >
+              Criba {cribaCount > 0 ? `(${cribaCount})` : ''}
+            </button>
+            <button
+              type="button"
+              className={tab === 'review' ? 'criba-stage-tab is-active' : 'criba-stage-tab'}
+              onClick={() => setTab('review')}
+            >
+              Revisión {proposals.length > 0 ? `(${proposals.length})` : ''}
+            </button>
+          </div>
           {proposals.length > 1 && (
             <nav className="aduana-rail" aria-label="Audios pendientes">
               {proposals.map((p) => (
@@ -347,6 +413,10 @@ export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
         </div>
       )}
 
+      {tab === 'criba' ? (
+        <AudioCribaPanel refreshKey={refreshKey} onChanged={onChanged} />
+      ) : (
+        <>
       {loading && !active && !isLive && (
         <p className="muted empty">Cargando aduana…</p>
       )}
@@ -532,6 +602,8 @@ export function CustomsPanel({ refreshKey, onEmpty, onChanged }: Props) {
             </div>
           </div>
         </div>
+      )}
+        </>
       )}
     </section>
   )

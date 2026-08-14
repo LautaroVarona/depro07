@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { getDb } from '../db.js'
 import { rows, row } from '../sql.js'
 import { cosineSimilarity, searchSimilar } from './embeddings.js'
+import { typeaheadEntities } from './typeahead.js'
 import { getOperatorId } from './entityRelations.js'
 
 /** Marca un par persona↔proyecto para no volver a sugerirlo (X o desvínculo). */
@@ -206,6 +207,21 @@ function hydrateSeed(
       score,
     }
   }
+  if (objectType === 'entry' || objectType === 'entry_chunk') {
+    const entryId =
+      objectType === 'entry_chunk' ? objectId.split(':')[0] ?? objectId : objectId
+    const e = row<{ title: string; content_raw: string | null }>(
+      db.prepare(`SELECT title, content_raw FROM entries WHERE id = ?`).get(entryId),
+    )
+    if (!e) return null
+    return {
+      type: 'entry',
+      id: entryId,
+      label: e.title,
+      snippet: (e.content_raw ?? '').slice(0, 160),
+      score,
+    }
+  }
   return null
 }
 
@@ -337,7 +353,7 @@ export async function searchGraphContext(query: string): Promise<string> {
   }
 
   const hits = await searchSimilar(q, {
-    types: ['person', 'project', 'quantomo'],
+    types: ['person', 'project', 'quantomo', 'entry', 'entry_chunk'],
     limit: 3,
   })
 
@@ -662,6 +678,7 @@ export function getGraphSnapshot(opts?: {
     INNER JOIN entries e ON e.id = pe.entry_id
     WHERE pe.entity_kind = 'person'
       AND pe.entity_id = ?
+    GROUP BY e.id
     ORDER BY COALESCE(e.timestamp_exact, e.created_at) DESC
     LIMIT 3
   `)
@@ -673,15 +690,22 @@ export function getGraphSnapshot(opts?: {
       content_raw: string | null
       at: string | null
     }>(evidenceStmt.all(projectId, personId))
-    return raw.map((r) => ({
-      entry_id: r.entry_id,
-      title: r.title,
-      snippet: (r.content_raw ?? '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 220),
-      at: r.at,
-    }))
+    const seen = new Set<string>()
+    const out: GraphLinkEvidence[] = []
+    for (const r of raw) {
+      if (seen.has(r.entry_id)) continue
+      seen.add(r.entry_id)
+      out.push({
+        entry_id: r.entry_id,
+        title: r.title,
+        snippet: (r.content_raw ?? '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 220),
+        at: r.at,
+      })
+    }
+    return out
   }
 
   const links: GraphVizLink[] = confirmed
@@ -1040,82 +1064,65 @@ export function getGraphSnapshot(opts?: {
   }
 }
 
-/** Búsqueda vectorial / léxica para zoom cinemático en el grafo. */
+/** Búsqueda léxica (typeahead) + semántica opcional para zoom en el grafo. */
 export async function searchGraphNodes(
   query: string,
   limit = 12,
+  opts?: { mode?: 'lexical' | 'semantic' | 'hybrid' },
 ): Promise<Array<{ id: string; type: string; label: string; score: number }>> {
   const q = query.trim()
   if (!q) return []
+  const mode = opts?.mode ?? 'lexical'
   const db = getDb()
-  const hits = await searchSimilar(q, {
-    types: ['person', 'project', 'quantomo'],
-    limit,
-  })
 
   const out: Array<{ id: string; type: string; label: string; score: number }> =
     []
-  for (const h of hits) {
-    if (h.object_type === 'person') {
-      const p = row<{ name: string }>(
-        db.prepare(`SELECT name FROM persons WHERE id = ?`).get(h.object_id),
-      )
-      if (p) out.push({ id: h.object_id, type: 'person', label: p.name, score: h.score })
-    } else if (h.object_type === 'project') {
-      const p = row<{ title: string }>(
-        db.prepare(`SELECT title FROM projects WHERE id = ?`).get(h.object_id),
-      )
-      if (p)
-        out.push({
-          id: h.object_id,
-          type: 'project',
-          label: p.title,
-          score: h.score,
-        })
-    } else if (h.object_type === 'quantomo') {
-      const qq = row<{ title: string }>(
-        db.prepare(`SELECT title FROM quantomos WHERE id = ?`).get(h.object_id),
-      )
-      if (qq)
-        out.push({
-          id: h.object_id,
-          type: 'quantomo',
-          label: qq.title,
-          score: h.score,
-        })
+  const seen = new Set<string>()
+
+  const push = (id: string, type: string, label: string, score: number) => {
+    if (seen.has(id)) return
+    seen.add(id)
+    out.push({ id, type, label, score })
+  }
+
+  if (mode === 'lexical' || mode === 'hybrid') {
+    const lexical = typeaheadEntities(q, {
+      kinds: ['person', 'project', 'quantomo'],
+      limit,
+      scope: 'all',
+    })
+    for (const h of lexical) {
+      push(h.id, h.kind, h.label, h.score)
     }
   }
 
-  // Fallback léxico si Mnemosyne vacío
-  if (out.length === 0) {
-    const like = `%${q}%`
-    const people = rows<{ id: string; name: string }>(
-      db
-        .prepare(
-          `SELECT id, name FROM persons
-           WHERE (merged_into IS NULL OR merged_into = '')
-             AND name LIKE ? COLLATE NOCASE
-           LIMIT 6`,
+  const wantSemantic =
+    mode === 'semantic' || (mode === 'hybrid' && out.length === 0)
+
+  if (wantSemantic) {
+    const hits = await searchSimilar(q, {
+      types: ['person', 'project', 'quantomo'],
+      limit,
+    })
+    for (const h of hits) {
+      if (h.object_type === 'person') {
+        const p = row<{ name: string }>(
+          db.prepare(`SELECT name FROM persons WHERE id = ?`).get(h.object_id),
         )
-        .all(like),
-    )
-    for (const p of people) {
-      out.push({ id: p.id, type: 'person', label: p.name, score: 0.5 })
-    }
-    const projs = rows<{ id: string; title: string }>(
-      db
-        .prepare(
-          `SELECT id, title FROM projects
-           WHERE (merged_into IS NULL OR merged_into = '')
-             AND title LIKE ? COLLATE NOCASE
-           LIMIT 6`,
+        if (p) push(h.object_id, 'person', p.name, h.score)
+      } else if (h.object_type === 'project') {
+        const p = row<{ title: string }>(
+          db.prepare(`SELECT title FROM projects WHERE id = ?`).get(h.object_id),
         )
-        .all(like),
-    )
-    for (const p of projs) {
-      out.push({ id: p.id, type: 'project', label: p.title, score: 0.5 })
+        if (p) push(h.object_id, 'project', p.title, h.score)
+      } else if (h.object_type === 'quantomo') {
+        const qq = row<{ title: string }>(
+          db.prepare(`SELECT title FROM quantomos WHERE id = ?`).get(h.object_id),
+        )
+        if (qq) push(h.object_id, 'quantomo', qq.title, h.score)
+      }
     }
   }
 
-  return out.slice(0, limit)
+  return out.sort((a, b) => b.score - a.score).slice(0, limit)
 }

@@ -17,6 +17,7 @@ import {
   normalizePersonKind,
   type PersonKind,
 } from './personKinds.js'
+import { refinePersonKind } from './nerGuards.js'
 
 export function normalizeName(raw: string): string {
   return raw
@@ -272,6 +273,29 @@ function buildEvidence(
   })
 }
 
+/** Ventana más amplia alrededor de la mención para el modo Validación. */
+export function expandMentionContext(
+  transcript: string | null | undefined,
+  mention: string,
+  radius = 240,
+): string {
+  const text = (transcript ?? '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  const needle = mention.trim()
+  if (!needle) return text.slice(0, Math.min(text.length, radius * 2))
+  const idx = text.toLowerCase().indexOf(needle.toLowerCase())
+  if (idx < 0) {
+    const slice = text.slice(0, Math.min(text.length, radius * 2))
+    return text.length > slice.length ? `${slice}…` : slice
+  }
+  const start = Math.max(0, idx - radius)
+  const end = Math.min(text.length, idx + needle.length + radius)
+  let out = text.slice(start, end).trim()
+  if (start > 0) out = `…${out}`
+  if (end < text.length) out = `${out}…`
+  return out
+}
+
 /**
  * Tras aprobar Aduana de entry: convierte entities raw en propuestas create/link.
  */
@@ -356,8 +380,11 @@ export function createEntityProposalsFromEntry(
     let meta: Record<string, unknown> = { ...payload }
 
     if (kind === 'person') {
-      const personKind: PersonKind = normalizePersonKind(
-        typeof payload.kind === 'string' ? payload.kind : raw.type,
+      const personKind: PersonKind = refinePersonKind(
+        name,
+        normalizePersonKind(
+          typeof payload.kind === 'string' ? payload.kind : raw.type,
+        ),
       )
       meta = { ...meta, kind: personKind }
 
@@ -367,6 +394,22 @@ export function createEntityProposalsFromEntry(
           ...meta,
           match_mode: 'none',
           discard_hint: personKind,
+        }
+        const rumboId =
+          typeof payload.suggested_match_id === 'string'
+            ? payload.suggested_match_id
+            : null
+        const rumboName =
+          typeof payload.suggested_match_name === 'string'
+            ? payload.suggested_match_name
+            : null
+        if (rumboId && rumboName) {
+          meta = {
+            ...meta,
+            suggested_match_id: rumboId,
+            suggested_match_name: rumboName,
+            match_mode: 'ruido',
+          }
         }
       } else {
         const match = findBestPersonMatch(name, persons)

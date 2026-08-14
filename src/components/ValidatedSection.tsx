@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type ProposalBundle } from '../services/api'
 
 interface Props {
@@ -97,12 +97,23 @@ export function ValidatedSection({ refreshKey }: Props) {
     }
   }, [])
 
+  const loadInFlight = useRef(false)
+
   useEffect(() => {
     void load()
   }, [load, refreshKey])
 
   useEffect(() => {
-    const id = window.setInterval(() => void load(), 8000)
+    const id = window.setInterval(() => {
+      if (loadInFlight.current) return
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return
+      }
+      loadInFlight.current = true
+      void load().finally(() => {
+        loadInFlight.current = false
+      })
+    }, 10000)
     return () => window.clearInterval(id)
   }, [load])
 

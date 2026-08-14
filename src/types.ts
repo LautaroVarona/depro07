@@ -1,9 +1,139 @@
 export type EntryStatus =
   | 'queued'
   | 'processing'
+  | 'pending_criba'
+  | 'pending_extract'
   | 'pending_review'
+  | 'split_parent'
   | 'approved'
   | 'rejected'
+
+export type NotebookKind = 'fisico' | 'digital' | 'system'
+export type NotebookIndexStatus = 'vacio' | 'parcial' | 'completo'
+
+export type PagePosicionVisual =
+  | 'Tapa'
+  | 'Suelta'
+  | 'Izquierda'
+  | 'Derecha'
+  | 'Contratapa'
+  | 'ImpactoTapa' // legacy
+
+export type PageStatus =
+  | 'Vacia'
+  | 'PendienteVision'
+  | 'PendienteValidacion'
+  | 'Validada'
+  | 'Procesada'
+
+export interface Notebook {
+  id: string
+  title: string
+  created_at: string
+  kind: NotebookKind
+  cover_url: string | null
+  total_sheets: number
+  total_faces: number
+  index_status: NotebookIndexStatus
+  index_json: string
+  updated_at: string
+}
+
+export interface NotebookIndexEntry {
+  slot_index: number
+  numero_logico: number
+  posicion: PagePosicionVisual
+  title: string | null
+  explanation_excerpt: string | null
+  status: PageStatus
+}
+
+export interface GraphicElement {
+  type: 'table' | 'shape' | 'connector' | 'drawing' | 'line'
+  bbox: [number, number, number, number]
+  label?: string | null
+  table?: { rows: string[][] } | null
+  points?: Array<[number, number]> | null
+}
+
+export interface NotebookPageVisionMeta {
+  layout: 'single' | 'spread' | 'cover' | 'unknown'
+  notes?: string | null
+  orientation_hint?: 0 | 90 | 180 | 270 | null
+  page_bbox?: [number, number, number, number] | null
+  spread?: {
+    divider_x: number
+    left_bbox: [number, number, number, number]
+    right_bbox: [number, number, number, number]
+    left_title?: string | null
+    right_title?: string | null
+    left_transcription?: string | null
+    right_transcription?: string | null
+  } | null
+  error?: string | null
+}
+
+export type NotebookProcessLog = {
+  ts: string
+  level: 'info' | 'warn' | 'error'
+  message: string
+  notebook_id?: string
+  slot_index?: number
+}
+
+export type NotebookQueueStatus = {
+  running: boolean
+  pending: number
+  confirm_running: boolean
+  confirm_pending: number
+  confirm_jobs?: Array<{ notebook_id: string; slot_index: number }>
+  current: {
+    notebook_id: string
+    slot_index: number
+    phase: 'vision' | 'explain' | 'confirm'
+  } | null
+  logs: NotebookProcessLog[]
+}
+
+export interface NotebookPage {
+  id: string
+  notebook_id: string
+  slot_index: number
+  numero_logico: number
+  posicion_visual: PagePosicionVisual
+  status: PageStatus
+  image_path: string | null
+  title: string | null
+  transcription_spatial: string | null
+  graphic_elements: string
+  vision_meta?: string | null
+  is_blank: number
+  entry_id: string | null
+  quantomo_id: string | null
+  explanation: string | null
+  explanation_user?: string | null
+  mentioned_entities?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type SpeakerAssignment = {
+  speaker: number
+  person_id: string | null
+  person_name: string | null
+}
+
+export type DiarizationUtterance = {
+  speaker: number
+  start: number
+  end: number
+  transcript: string
+}
+
+export type DiarizationPayload = {
+  utterances: DiarizationUtterance[]
+  speakers: number[]
+}
 
 export interface Entry {
   id: string
@@ -17,6 +147,14 @@ export interface Entry {
   created_at: string
   title_manual?: number
   original_filename?: string | null
+  batch_id?: string | null
+  parent_entry_id?: string | null
+  manual_tags?: string | null
+  operator_note?: string | null
+  human_weight?: number | null
+  diarization_json?: string | null
+  speaker_map?: string | null
+  duration_sec?: number | null
 }
 
 export interface Quantomo {
@@ -25,8 +163,170 @@ export interface Quantomo {
   title: string
   content: string | null
   hermetic_weight: number | null
+  human_weight?: number | null
+  suggested_weight?: number | null
   universe: string | null
   recognized: number
+}
+
+export type BookmarkStatus =
+  | 'PENDIENTE_CRIBA'
+  | 'CRIBADO'
+  | 'PROCESADO_IA'
+  | 'SLOP'
+
+export type BookmarkSource = 'twitter' | 'instagram'
+
+export type BookmarkCategory =
+  | 'HERRAMIENTAS'
+  | 'CONCEPTOS'
+  | 'ENTIDADES'
+  | 'NEGOCIOS'
+  | 'ARTE'
+  | 'ARCHIVO'
+
+export interface Bookmark {
+  id: string
+  text: string
+  author_name: string | null
+  author_username: string | null
+  created_at_source: string | null
+  link: string | null
+  media_urls: string
+  weight: number | null
+  status: BookmarkStatus
+  category: string | null
+  extracted_entities: string
+  suggested_links: string
+  quantomo: string | null
+  entry_id: string | null
+  quantomo_id: string | null
+  imported_at: string
+  source?: BookmarkSource
+  shortcode?: string | null
+  media_pk?: string | null
+  likes?: number | null
+  comments?: number | null
+  local_media_path?: string | null
+  transcript?: string | null
+  ocr_json?: string
+  enrichment_json?: string
+  /** Nota libre del operador durante la criba. */
+  operator_note?: string
+  /** Tags @ persona|proyecto elegidos a mano en criba (JSON). */
+  manual_tags?: string
+}
+
+export interface BookmarkManualTag {
+  kind: 'person' | 'project'
+  entity_id: string
+  entity_name: string
+}
+
+export type BlobTagKind = 'person' | 'project' | 'agrupacion'
+
+export interface BlobTag {
+  kind: BlobTagKind
+  entity_id: string
+  entity_name: string
+}
+
+export interface BlobNote {
+  id: string
+  title: string
+  content_raw: string
+  timestamp_exact: string
+  created_at: string
+  quantomo_id: string | null
+  quantomos?: Array<{ id: string; title: string; content: string | null }>
+  tags: BlobTag[]
+}
+
+export interface BookmarkSuggestedLink {
+  kind: 'person' | 'project'
+  label: string
+  entity_id: string
+  entity_name: string
+  score: number
+  suggestion: string
+}
+
+export interface BookmarkCounts {
+  total: number
+  pendientes: number
+  cribados: number
+  procesados: number
+  /** Alias de procesados (PROCESADO_IA). */
+  procesados_ia?: number
+  /** Solo status CRIBADO (validados, aún sin IA). */
+  validados?: number
+  high_value_ready: number
+  awaiting_approval: number
+  /** Alias de awaiting_approval. */
+  sin_aprobar?: number
+  /** PROCESADO_IA + recognized=1. */
+  aprobados?: number
+  slop?: number
+  by_source?: {
+    twitter: {
+      total: number
+      pendientes: number
+      cribados: number
+      validados?: number
+    }
+    instagram: {
+      total: number
+      pendientes: number
+      cribados: number
+      validados?: number
+    }
+  }
+}
+
+export interface BookmarkProcessedRow {
+  id: string
+  text: string
+  author_name: string | null
+  author_username: string | null
+  created_at_source: string | null
+  link: string | null
+  weight: number | null
+  status: string
+  category: string | null
+  source?: string | null
+  quantomo_id: string | null
+  entry_id: string | null
+  imported_at: string
+  title: string | null
+  quantomo_content: string | null
+  recognized: number | null
+  /** Frames Vision guardados (0 = falta OCR). */
+  ocr_frame_count?: number
+  /** IG w≥10 sin frames → candidato a Reprocesar OCR. */
+  needs_ocr?: boolean
+}
+
+export interface BookmarkQueueStatus {
+  running: boolean
+  stop_requested: boolean
+  target: number
+  done: number
+  remaining: number
+  skipped: number
+  current_id: string | null
+  current_title: string | null
+  last_item: {
+    id: string
+    weight: number
+    category: string
+    quantomo: string
+    quantomo_id: string
+    entry_id: string
+    title: string
+  } | null
+  errors: Array<{ id: string; error: string }>
+  started_at: string | null
+  finished_at: string | null
 }
 
 export interface PendingTask {
@@ -148,6 +448,36 @@ export interface PersonProjectLink {
   project_category?: string | null
 }
 
+export interface AgrupacionGeneratedMeta {
+  summary: string
+  tags: string[]
+  themes: string[]
+  related_person_names: string[]
+  related_categories: string[]
+  inferred_facts: string[]
+}
+
+export interface Agrupacion {
+  id: string
+  name: string
+  notes: string | null
+  generated_meta: string
+  created_at: string
+  updated_at: string
+  member_count?: number
+  generated_meta_parsed?: AgrupacionGeneratedMeta
+}
+
+export interface AgrupacionMember {
+  id: string
+  agrupacion_id: string
+  person_id: string
+  created_at: string
+  person_name?: string
+  person_kind?: PersonKind | string
+  person_source?: string
+}
+
 export interface EntityLink {
   id: string
   entity_kind: 'person' | 'project'
@@ -178,8 +508,11 @@ export interface EntityProposalView {
   }
   evidence_parsed: {
     snippet?: string
+    mention?: string
     entry_title?: string
     quantomo_id?: string | null
+    /** Ventana ampliada del texto de origen (modo Validación). */
+    context?: string
   }
   suggested_match: {
     id: string
@@ -187,6 +520,13 @@ export interface EntityProposalView {
     score: number
   } | null
   entry_title?: string
+  entry?: {
+    id: string
+    title: string
+    status?: string
+    source_type?: string
+    original_filename?: string | null
+  } | null
 }
 
 /** Sugerencia de vínculo por co-ocurrencia (mismo entry_id). */
@@ -262,4 +602,137 @@ export interface GraphSnapshot {
     suggested_links: number
     semantic_links: number
   }
+}
+
+export type SandboxNodeKind = 'freeform' | 'person' | 'project' | 'quantomo'
+export type SandboxLinkKind = 'manual' | 'quantomo_bridge'
+
+export interface SandboxGraph {
+  id: string
+  name: string
+  description: string
+  created_at: string
+  updated_at: string
+}
+
+export interface SandboxNode {
+  id: string
+  graph_id: string
+  kind: SandboxNodeKind
+  ref_id: string | null
+  label: string
+  color: string | null
+  notes: string
+  fx: number | null
+  fy: number | null
+  fz: number | null
+  created_at: string
+}
+
+export interface SandboxLink {
+  id: string
+  graph_id: string
+  source_node_id: string
+  target_node_id: string
+  kind: SandboxLinkKind
+  label: string
+  quantomo_id: string | null
+  promoted_at: string | null
+  created_at: string
+}
+
+export interface SandboxSnapshot {
+  graph: SandboxGraph
+  nodes: SandboxNode[]
+  links: SandboxLink[]
+}
+
+export type ChatTipo = 'individual' | 'grupo'
+
+export type ChatSessionStatus =
+  | 'parsed'
+  | 'processing'
+  | 'processed'
+  | 'error'
+
+export type ChatMessageEstado = 'pendiente' | 'analizado'
+
+export type ChatBlockEstado = 'pendiente' | 'analizado' | 'error'
+
+export type LinkHarvestSourceType =
+  | 'chat_message'
+  | 'quantomo'
+  | 'entry'
+  | 'bookmark'
+
+export type LinkCrawlerEstado = 'pendiente' | 'crawled' | 'error' | 'skipped'
+
+export interface ChatSession {
+  id: string
+  origin_hash: string
+  nombre_chat: string
+  tipo: ChatTipo
+  participantes_json: string
+  linked_person_ids_json: string
+  vault_path: string | null
+  status: ChatSessionStatus
+  created_at: string
+  updated_at: string
+  message_count?: number
+  block_count?: number
+  link_count?: number
+  pending_blocks?: number
+}
+
+export interface ChatMessage {
+  id: string
+  chat_session_id: string
+  remitente: string | null
+  texto_crudo: string
+  timestamp_exact: string
+  is_system: number
+  is_media: number
+  estado_procesamiento: ChatMessageEstado
+  block_id: string | null
+  sort_index: number
+}
+
+export interface ChatBlock {
+  id: string
+  chat_session_id: string
+  started_at: string
+  ended_at: string
+  day_key: string
+  message_count: number
+  estado: ChatBlockEstado
+  entry_id: string | null
+  quantomo_id: string | null
+  summary_json: string
+}
+
+export interface LinkHarvest {
+  id: string
+  url_cruda: string
+  url_norm: string
+  source_type: LinkHarvestSourceType
+  source_id: string
+  remitente: string | null
+  timestamp_captura: string | null
+  chat_session_id: string | null
+  estado_crawler: LinkCrawlerEstado
+  created_at: string
+  chat_nombre?: string | null
+}
+
+export interface ChatPreview {
+  suggested_name: string
+  tipo_auto: ChatTipo
+  participantes: string[]
+  message_count: number
+  system_count: number
+  media_count: number
+  link_count: number
+  first_ts: string | null
+  last_ts: string | null
+  origin_hash: string
 }

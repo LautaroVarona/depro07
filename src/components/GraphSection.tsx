@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ForceGraph2D, {
-  type ForceGraphMethods,
   type LinkObject,
   type NodeObject,
 } from 'react-force-graph-2d'
+import ForceGraph3D from 'react-force-graph-3d'
 import { api } from '../services/api'
 import type {
   EntityLink,
@@ -27,14 +27,18 @@ import { SuggestedLinksTray } from './SuggestedLinksTray'
 interface Props {
   refreshKey: number
   onChanged?: () => void
+  /** Babel = 2d (default); Babel 3D = misma data en WebGL */
+  mode?: '2d' | '3d'
 }
 
 type GNode = NodeObject &
   GraphVizNode & {
     x?: number
     y?: number
+    z?: number
     fx?: number | null
     fy?: number | null
+    fz?: number | null
   }
 
 type GLink = LinkObject &
@@ -163,9 +167,14 @@ function passesLayer(n: GraphVizNode, s: GraphSettings['layers']): boolean {
   return true
 }
 
-export function GraphSection({ refreshKey, onChanged }: Props) {
+export function GraphSection({ refreshKey, onChanged, mode = '2d' }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null)
-  const fgRef = useRef<ForceGraphMethods<GNode, GLink> | undefined>(undefined)
+  // Refs separados: mezclar 2D/3D en uno solo rompe el engine (tick undefined)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fg2Ref = useRef<any>(undefined)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fg3Ref = useRef<any>(undefined)
+  const activeFg = () => (mode === '3d' ? fg3Ref.current : fg2Ref.current)
   const [size, setSize] = useState({ w: 900, h: 600 })
   const [snapshot, setSnapshot] = useState<GraphSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
@@ -186,6 +195,11 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
   } | null>(null)
   const [searchQ, setSearchQ] = useState('')
   const [searchBusy, setSearchBusy] = useState(false)
+  const [searchHits, setSearchHits] = useState<
+    Array<{ id: string; type: string; label: string; score: number }>
+  >([])
+  const searchAbort = useRef<AbortController | null>(null)
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [inspect, setInspect] = useState<{
     person?: Person
     project?: Project
@@ -293,16 +307,16 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
 
   // Encadrar el grafo cuando hay datos
   useEffect(() => {
-    if (!fgRef.current || graphData.nodes.length === 0) return
+    if (graphData.nodes.length === 0) return
     const t = window.setTimeout(() => {
       try {
-        fgRef.current?.zoomToFit(400, 60)
+        activeFg()?.zoomToFit?.(400, 60)
       } catch {
         /* ignore */
       }
-    }, 350)
+    }, 400)
     return () => window.clearTimeout(t)
-  }, [graphData.nodes.length, timeDay, layers.showQuantomos, layers.showPersons, layers.showProjects])
+  }, [graphData.nodes.length, timeDay, layers.showQuantomos, layers.showPersons, layers.showProjects, mode])
 
   const tunnel = useMemo(() => {
     if (selected && layers.focusMode) {
@@ -314,89 +328,114 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
     return null
   }, [selected, layers.focusMode, hoverId, graphData.links])
 
-  // Físicas
+  // Físicas (diferidas: el engine 3D no tiene forceLayout en el primer paint)
   useEffect(() => {
-    const fg = fgRef.current
-    if (!fg || graphData.nodes.length === 0) return
+    if (graphData.nodes.length === 0) return
+    let cancelled = false
+    const apply = () => {
+      if (cancelled) return
+      const fg = activeFg()
+      if (!fg || typeof fg.d3Force !== 'function') return
 
-    const linkForce = fg.d3Force('link') as
-      | {
-          distance: (fn: (l: GLink) => number) => unknown
-          strength: (fn: (l: GLink) => number) => unknown
+      try {
+        const linkForce = fg.d3Force('link') as
+          | {
+              distance: (fn: (l: GLink) => number) => unknown
+              strength: (fn: (l: GLink) => number) => unknown
+            }
+          | undefined
+
+        const g = layers.linkGravity
+        if (linkForce) {
+          linkForce.distance((l: GLink) => {
+            if (l.kind === 'orbit') return 28 + (12 - (l.weight ?? 5)) * 2
+            const sim =
+              typeof l.similarity === 'number'
+                ? Math.max(0, Math.min(1, l.similarity))
+                : l.kind === 'confirmed'
+                  ? 0.55
+                  : 0.3
+            return (32 + (1 - sim) * 240) / Math.max(0.4, g)
+          })
+          linkForce.strength((l: GLink) => {
+            if (l.kind === 'orbit') return 0.85
+            if (l.kind === 'semantic')
+              return (0.12 + (l.similarity ?? 0.4) * 0.5) * g
+            if (l.kind === 'confirmed') return 0.5 * g
+            return 0.22 * g
+          })
         }
-      | undefined
 
-    const g = layers.linkGravity
-    if (linkForce) {
-      linkForce.distance((l: GLink) => {
-        if (l.kind === 'orbit') return 28 + (12 - (l.weight ?? 5)) * 2
-        const sim =
-          typeof l.similarity === 'number'
-            ? Math.max(0, Math.min(1, l.similarity))
-            : l.kind === 'confirmed'
-              ? 0.55
-              : 0.3
-        return (32 + (1 - sim) * 240) / Math.max(0.4, g)
-      })
-      linkForce.strength((l: GLink) => {
-        if (l.kind === 'orbit') return 0.85
-        if (l.kind === 'semantic') return (0.12 + (l.similarity ?? 0.4) * 0.5) * g
-        if (l.kind === 'confirmed') return 0.5 * g
-        return 0.22 * g
-      })
-    }
+        const charge = fg.d3Force('charge') as
+          | { strength: (v: number | ((n: GNode) => number)) => unknown }
+          | undefined
+        charge?.strength((n: GNode) => {
+          const base = layers.chargeStrength
+          if (n.type === 'quantomo') return base * 0.35
+          if (n.type === 'orphan') return base * 0.5
+          return base * (1 + Math.min(2, (n.mass ?? 1) / 20))
+        })
 
-    const charge = fg.d3Force('charge') as
-      | { strength: (v: number | ((n: GNode) => number)) => unknown }
-      | undefined
-    charge?.strength((n: GNode) => {
-      const base = layers.chargeStrength
-      if (n.type === 'quantomo') return base * 0.35
-      if (n.type === 'orphan') return base * 0.5
-      return base * (1 + Math.min(2, (n.mass ?? 1) / 20))
-    })
+        const opId = snapshot?.operator_id
+        for (const n of graphData.nodes) {
+          if (layers.godMode && opId && n.id === opId) {
+            n.fx = 0
+            n.fy = 0
+            if (mode === '3d') n.fz = 0
+          } else if (n.fx != null || n.fy != null || n.fz != null) {
+            n.fx = undefined
+            n.fy = undefined
+            n.fz = undefined
+          }
+        }
 
-    // God-mode: pin operator + anillos
-    const opId = snapshot?.operator_id
-    for (const n of graphData.nodes) {
-      if (layers.godMode && opId && n.id === opId) {
-        n.fx = 0
-        n.fy = 0
-      } else if (n.fx != null || n.fy != null) {
-        n.fx = undefined
-        n.fy = undefined
+        if (layers.godMode && opId && mode === '2d') {
+          const opLinks = graphData.links.filter((l) => {
+            const s = nodeId(l.source)
+            const t = nodeId(l.target)
+            return (
+              (s === opId || t === opId) &&
+              (l.kind === 'confirmed' || l.kind === 'semantic')
+            )
+          })
+          const ring = new Map<string, number>()
+          for (const l of opLinks) {
+            const other =
+              nodeId(l.source) === opId ? nodeId(l.target) : nodeId(l.source)
+            const sim = l.similarity ?? 0.4
+            const r = 80 + (1 - sim) * 280
+            ring.set(other, r)
+          }
+          let i = 0
+          for (const n of graphData.nodes) {
+            const r = ring.get(String(n.id))
+            if (r == null || n.id === opId) continue
+            const ang = (i / Math.max(1, ring.size)) * Math.PI * 2
+            n.fx = Math.cos(ang) * r
+            n.fy = Math.sin(ang) * r
+            i += 1
+          }
+        }
+
+        fg.d3ReheatSimulation?.()
+      } catch {
+        /* engine aún no listo */
       }
     }
 
-    if (layers.godMode && opId) {
-      const opLinks = graphData.links.filter((l) => {
-        const s = nodeId(l.source)
-        const t = nodeId(l.target)
-        return (
-          (s === opId || t === opId) &&
-          (l.kind === 'confirmed' || l.kind === 'semantic')
-        )
-      })
-      const ring = new Map<string, number>()
-      for (const l of opLinks) {
-        const other = nodeId(l.source) === opId ? nodeId(l.target) : nodeId(l.source)
-        const sim = l.similarity ?? 0.4
-        const r = 80 + (1 - sim) * 280
-        ring.set(other, r)
-      }
-      let i = 0
-      for (const n of graphData.nodes) {
-        const r = ring.get(String(n.id))
-        if (r == null || n.id === opId) continue
-        const ang = (i / Math.max(1, ring.size)) * Math.PI * 2
-        n.fx = Math.cos(ang) * r
-        n.fy = Math.sin(ang) * r
-        i += 1
-      }
+    const t = window.setTimeout(apply, 100)
+    return () => {
+      cancelled = true
+      window.clearTimeout(t)
     }
-
-    fg.d3ReheatSimulation()
-  }, [graphData, layers.chargeStrength, layers.linkGravity, layers.godMode, snapshot?.operator_id])
+  }, [
+    graphData,
+    layers.chargeStrength,
+    layers.linkGravity,
+    layers.godMode,
+    snapshot?.operator_id,
+    mode,
+  ])
 
   const loadInspect = useCallback(async (n: GNode) => {
     setInspect(null)
@@ -545,31 +584,38 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
     const s = g.source as GNode
     const t = g.target as GNode
     const wrap = wrapRef.current?.getBoundingClientRect()
-    const fg = fgRef.current
+    const fg = activeFg()
     if (!wrap || !fg) {
       setLinkHud({ x: 24, y: 24, link: g })
       return
     }
-    const mid = fg.graph2ScreenCoords(
-      ((s.x ?? 0) + (t.x ?? 0)) / 2,
-      ((s.y ?? 0) + (t.y ?? 0)) / 2,
-    )
+    const mx = ((s.x ?? 0) + (t.x ?? 0)) / 2
+    const my = ((s.y ?? 0) + (t.y ?? 0)) / 2
+    const mz = ((s.z ?? 0) + (t.z ?? 0)) / 2
+    const mid =
+      mode === '3d'
+        ? fg.graph2ScreenCoords(mx, my, mz)
+        : fg.graph2ScreenCoords(mx, my)
     setLinkHud({
       x: Math.min(wrap.width - 280, Math.max(8, mid.x + 12)),
       y: Math.min(wrap.height - 120, Math.max(8, mid.y + 12)),
       link: g,
     })
-  }, [])
+  }, [mode])
 
-  const runSearch = useCallback(async () => {
-    const q = searchQ.trim()
+  const runSearch = useCallback(async (overrideQ?: string) => {
+    const q = (overrideQ ?? searchQ).trim()
     if (!q) return
     setSearchBusy(true)
+    setError(null)
     try {
-      const res = await api.searchGraphNodes(q, 10)
+      let res = await api.searchGraphNodes(q, 10, { mode: 'lexical' })
+      if (res.results.length === 0) {
+        res = await api.searchGraphNodes(q, 10, { mode: 'semantic' })
+      }
       const ids = new Set(res.results.map((r) => r.id))
       if (ids.size === 0) {
-        setError('Sin clúster semántico para esa query')
+        setError('Sin coincidencias para esa query')
         return
       }
       const nodes = graphData.nodes.filter((n) => ids.has(String(n.id)))
@@ -584,13 +630,53 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
         void loadInspect(focus)
         setDrawerOpen(true)
       }
-      fgRef.current?.zoomToFit(700, 80, (n) => ids.has(String((n as GNode).id)))
+      activeFg()?.zoomToFit?.(700, 80, (n: GNode) => ids.has(String(n.id)))
+      setSearchHits([])
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Búsqueda fallida')
     } finally {
       setSearchBusy(false)
     }
-  }, [searchQ, graphData.nodes, loadInspect])
+  }, [searchQ, graphData.nodes, loadInspect, mode])
+
+  useEffect(() => {
+    const q = searchQ.trim()
+    if (searchTimer.current) clearTimeout(searchTimer.current)
+    searchAbort.current?.abort()
+    if (!q) {
+      setSearchHits([])
+      return
+    }
+    searchTimer.current = setTimeout(() => {
+      const ac = new AbortController()
+      searchAbort.current = ac
+      void (async () => {
+        try {
+          const res = await api.typeaheadEntities(q, {
+            kinds: ['person', 'project', 'quantomo'],
+            limit: 8,
+            scope: 'all',
+            signal: ac.signal,
+          })
+          if (ac.signal.aborted) return
+          setSearchHits(
+            res.results.map((h) => ({
+              id: h.id,
+              type: h.kind,
+              label: h.label,
+              score: h.score,
+            })),
+          )
+        } catch {
+          if (!ac.signal.aborted) setSearchHits([])
+        }
+      })()
+    }, 120)
+    return () => {
+      if (searchTimer.current) clearTimeout(searchTimer.current)
+      searchAbort.current?.abort()
+    }
+  }, [searchQ])
 
   const onNodeDragEnd = useCallback(
     async (node: NodeObject) => {
@@ -703,9 +789,55 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
               </button>
             </div>
           </div>
+        ) : mode === '3d' ? (
+          <ForceGraph3D
+            ref={fg3Ref}
+            width={size.w}
+            height={size.h}
+            graphData={graphData as never}
+            nodeId="id"
+            nodeVal={(n) => Math.max(1, (n as GNode).mass ?? 1)}
+            nodeLabel={(n) => (n as GNode).label || ''}
+            nodeColor={(n) => {
+              const node = n as GNode
+              if (node.type === 'orphan' || node.orphan) return colors.orphan
+              if (node.type === 'quantomo') return colors.quantomo
+              if (node.type === 'person') return colors.person
+              return colors.project
+            }}
+            backgroundColor={colors.bg}
+            showNavInfo={false}
+            linkVisibility={(l) => linkVisibility(l as GLink)}
+            linkColor={(l) => linkColor(l as GLink)}
+            linkWidth={(l) => linkWidth(l as GLink)}
+            cooldownTicks={140}
+            warmupTicks={40}
+            onNodeHover={(n) => {
+              const node = n as GNode | null
+              setHoverId(node ? String(node.id) : null)
+              setHoverQuantomo(
+                node && (node.type === 'quantomo' || node.type === 'orphan')
+                  ? node
+                  : null,
+              )
+            }}
+            onNodeClick={(n) => {
+              const node = n as GNode
+              setSelected(node)
+              setDrawerOpen(true)
+              void loadInspect(node)
+            }}
+            onBackgroundClick={() => {
+              setSelected(null)
+              setLinkHud(null)
+              setHoverQuantomo(null)
+            }}
+            onLinkHover={(l) => onLinkHover(l as LinkObject | null)}
+            onNodeDragEnd={(n) => void onNodeDragEnd(n as NodeObject)}
+          />
         ) : (
           <ForceGraph2D
-            ref={fgRef}
+            ref={fg2Ref}
             width={size.w}
             height={size.h}
             graphData={graphData}
@@ -794,8 +926,9 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
           <input
             value={searchQ}
             onChange={(e) => setSearchQ(e.target.value)}
-            placeholder="GraphRAG · planes de igualdad…"
+            placeholder="Buscar nodo…"
             className="graph-cmd"
+            autoComplete="off"
           />
           <button
             type="submit"
@@ -804,6 +937,25 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
           >
             {searchBusy ? '…' : 'Ir'}
           </button>
+          {searchHits.length > 0 && (
+            <ul className="graph-search-suggest" role="listbox">
+              {searchHits.map((h) => (
+                <li key={`${h.type}:${h.id}`}>
+                  <button
+                    type="button"
+                    className="graph-search-suggest-item"
+                    onClick={() => {
+                      setSearchQ(h.label)
+                      setSearchHits([])
+                      void runSearch(h.label)
+                    }}
+                  >
+                    <span className="mono">{h.type}</span> {h.label}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </form>
 
         {/* HUD: tools */}
@@ -857,8 +1009,8 @@ export function GraphSection({ refreshKey, onChanged }: Props) {
                 : ''}
             </header>
             <ul className="graph-link-hud-list">
-              {(linkHud.link.evidence as GraphLinkEvidence[]).map((ev) => (
-                <li key={ev.entry_id}>
+              {(linkHud.link.evidence as GraphLinkEvidence[]).map((ev, i) => (
+                <li key={`${ev.entry_id}:${ev.at ?? ''}:${i}`}>
                   <strong className="mono">{ev.title}</strong>
                   <p>
                     {ev.snippet

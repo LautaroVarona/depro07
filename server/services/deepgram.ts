@@ -1,9 +1,17 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+export interface DiarizedUtterance {
+  speaker: number
+  start: number
+  end: number
+  transcript: string
+}
+
 export interface TranscriptResult {
   text: string
   stub: boolean
+  utterances: DiarizedUtterance[]
 }
 
 function env(key: string, fallback = ''): string {
@@ -154,6 +162,12 @@ interface DeepgramJson {
         paragraphs?: { transcript?: string }
       }>
     }>
+    utterances?: Array<{
+      speaker?: number
+      start?: number
+      end?: number
+      transcript?: string
+    }>
   }
 }
 
@@ -164,19 +178,52 @@ function extractTranscript(data: DeepgramJson): string {
   return alt?.transcript?.trim() ?? ''
 }
 
+function extractUtterances(
+  data: DeepgramJson,
+  timeOffset = 0,
+): DiarizedUtterance[] {
+  const raw = data.results?.utterances
+  if (!Array.isArray(raw) || raw.length === 0) return []
+  return raw
+    .map((u) => ({
+      speaker: Number(u.speaker ?? 0) || 0,
+      start: Number(u.start ?? 0) + timeOffset,
+      end: Number(u.end ?? 0) + timeOffset,
+      transcript: String(u.transcript ?? '').trim(),
+    }))
+    .filter((u) => u.transcript.length > 0)
+}
+
+function formatDiarizedText(utterances: DiarizedUtterance[]): string {
+  if (utterances.length === 0) return ''
+  const lines: string[] = []
+  let last = -1
+  for (const u of utterances) {
+    if (u.speaker !== last) {
+      lines.push(`\n[Speaker ${u.speaker}] ${u.transcript}`)
+      last = u.speaker
+    } else {
+      lines.push(u.transcript)
+    }
+  }
+  return lines.join('\n').trim()
+}
+
 async function deepgramListen(
   apiKey: string,
   audio: Buffer,
   mime: string,
   model: string,
   language: string,
-): Promise<string> {
+): Promise<{ text: string; utterances: DiarizedUtterance[] }> {
   const params = new URLSearchParams({
     model,
     language,
     punctuate: 'true',
     paragraphs: 'true',
     smart_format: 'true',
+    diarize: 'true',
+    utterances: 'true',
   })
 
   const timeoutMs = Number(env('DEEPGRAM_TIMEOUT_MS', '90000')) || 90000
@@ -203,7 +250,10 @@ async function deepgramListen(
     }
 
     const data = (await res.json()) as DeepgramJson
-    return extractTranscript(data)
+    const utterances = extractUtterances(data)
+    const labeled = formatDiarizedText(utterances)
+    const text = labeled || extractTranscript(data)
+    return { text, utterances }
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
       throw new Error(`Deepgram timeout tras ${timeoutMs}ms`)
@@ -297,6 +347,7 @@ export async function transcribeAudio(
     }
 
     const transcripts: string[] = []
+    const allUtterances: DiarizedUtterance[] = []
     let emptyStreak = 0
 
     for (let i = 0; i < parts.length; i++) {
@@ -307,8 +358,22 @@ export async function transcribeAudio(
       if (i > 0 && chunkDelayMs > 0) await delay(chunkDelayMs)
 
       let text = ''
+      let chunkUtt: DiarizedUtterance[] = []
       try {
-        text = await deepgramListen(dgKey, parts[i]!, mime, model, language)
+        const listened = await deepgramListen(
+          dgKey,
+          parts[i]!,
+          mime,
+          model,
+          language,
+        )
+        text = listened.text
+        const offset = i * chunkSeconds
+        chunkUtt = listened.utterances.map((u) => ({
+          ...u,
+          start: u.start + offset,
+          end: u.end + offset,
+        }))
       } catch (err) {
         console.warn(
           `[deepgram] chunk ${i + 1}/${parts.length} error:`,
@@ -318,9 +383,10 @@ export async function transcribeAudio(
 
       if (text) {
         transcripts.push(text)
+        allUtterances.push(...chunkUtt)
         emptyStreak = 0
         console.log(
-          `[deepgram] chunk ${i + 1}/${parts.length}: ${text.length} chars`,
+          `[deepgram] chunk ${i + 1}/${parts.length}: ${text.length} chars · ${chunkUtt.length} utt`,
         )
         onProgress?.(transcripts.join('\n\n').trim(), {
           chunk: i + 1,
@@ -358,7 +424,7 @@ export async function transcribeAudio(
       return stub
     }
 
-    return { text: joined, stub: false }
+    return { text: joined, stub: false, utterances: allUtterances }
   } catch (err) {
     console.error('[deepgram] failed, using stub:', err)
     const stub = stubTranscript(title)
@@ -377,5 +443,5 @@ function stubTranscript(title: string): TranscriptResult {
     'revisar el vault de audios, validar quántomos y aprobar propuestas en aduana.',
     'Marca temporal aproximada: 0:00 inicio, 0:15 ideas, 0:40 cierre.',
   ].join(' ')
-  return { text, stub: true }
+  return { text, stub: true, utterances: [] }
 }

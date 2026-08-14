@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type Entry } from '../services/api'
+import type { BookmarkManualTag } from '../types'
+import { BlobComposer } from './BlobComposer'
+import { TagField } from './TagField'
 
 const AUDIO_EXTS = [
   '.m4a',
@@ -26,19 +29,26 @@ function isAcceptedAudio(file: File): boolean {
 
 interface Props {
   onProcessed: () => void
+  onChanged?: () => void
 }
 
-export function FreeZone({ onProcessed }: Props) {
+export function FreeZone({ onProcessed, onChanged }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [selected, setSelected] = useState<File[]>([])
   const [queued, setQueued] = useState<Entry[]>([])
+  const [batchTags, setBatchTags] = useState<BookmarkManualTag[]>([])
+  const [batchNote, setBatchNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [paused, setPaused] = useState(false)
   const [running, setRunning] = useState(false)
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  const refreshInFlight = useRef(false)
+
   const refreshQueued = useCallback(async () => {
+    if (refreshInFlight.current) return
+    refreshInFlight.current = true
     try {
       const [data, pipe] = await Promise.all([
         api.getQueued(),
@@ -49,12 +59,14 @@ export function FreeZone({ onProcessed }: Props) {
       setRunning(pipe.running)
     } catch (err) {
       console.error(err)
+    } finally {
+      refreshInFlight.current = false
     }
   }, [])
 
   useEffect(() => {
     void refreshQueued()
-    const id = window.setInterval(() => void refreshQueued(), 4000)
+    const id = window.setInterval(() => void refreshQueued(), 5000)
     return () => window.clearInterval(id)
   }, [refreshQueued])
 
@@ -98,13 +110,19 @@ export function FreeZone({ onProcessed }: Props) {
     try {
       if (selected.length > 0) {
         const files = [...selected]
+        const batchId = crypto.randomUUID()
+        const meta = {
+          batch_id: batchId,
+          manual_tags: batchTags,
+          operator_note: batchNote,
+        }
         let uploaded = 0
         for (let i = 0; i < files.length; i++) {
           const f = files[i]!
           const mb = (f.size / (1024 * 1024)).toFixed(1)
           setStatus(`Subiendo ${i + 1}/${files.length}: ${f.name} (${mb} MB)`)
           console.log(`[freezone] upload ${i + 1}/${files.length}`, f.name, mb)
-          const result = await api.ingestAudioOne(f)
+          const result = await api.ingestAudioOne(f, meta)
           uploaded += result.entries.length
           // quitar de la selección a medida que sube
           setSelected((prev) =>
@@ -120,7 +138,7 @@ export function FreeZone({ onProcessed }: Props) {
       setPaused(false)
       setStatus(
         pipeline.message ||
-          'Pipeline en marcha — la aduana aparece al terminar.',
+          'Pipeline en marcha — la criba de Aduana aparece al transcribir.',
       )
       await refreshQueued()
       onProcessed()
@@ -203,6 +221,8 @@ export function FreeZone({ onProcessed }: Props) {
         )}
       </header>
 
+      <BlobComposer onChanged={onChanged} />
+
       <div
         className="dropzone"
         onDragOver={(e) => e.preventDefault()}
@@ -225,6 +245,20 @@ export function FreeZone({ onProcessed }: Props) {
             .m4a · .mp3 · .ogg · .opus · .aac · .wav
           </span>
         </p>
+      </div>
+
+      <div className="audio-batch-tags">
+        <p className="blob-composer-label">Tags del lote</p>
+        <TagField
+          tags={batchTags}
+          note={batchNote}
+          disabled={busy}
+          placeholder="Aplica a todos los audios de esta carga. @ persona o proyecto."
+          onChange={({ tags, note }) => {
+            setBatchTags(tags)
+            setBatchNote(note)
+          }}
+        />
       </div>
 
       {selected.length > 0 && (

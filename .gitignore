@@ -2,9 +2,17 @@ node_modules/
 dist/
 data/
 vault/
+tools/*.exe
+tools/yt-dlp
+tools/ffmpeg*
+tools/*.dll
+tools/ffprobe*
+tools/ffplay*
 *.db
 *.db-journal
 .DS_Store
 *.log
 .env.local
 .env
+x-bookmarks-raw-*.csv
+feedback/

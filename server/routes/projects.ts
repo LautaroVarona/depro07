@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { randomUUID } from 'node:crypto'
-import { getDb, syncProjectAliases } from '../db.js'
+import { getDb, syncProjectAliases, removeProjectFts } from '../db.js'
 import { row, rowRequired, rows } from '../sql.js'
 import type {
   EntityLink,
@@ -20,11 +20,8 @@ import {
   buildWaitingWithMatches,
   listMasterProjects,
 } from '../services/projectMatchmaker.js'
-import {
-  liveSuggestedProjectMatch,
-  normalizeName,
-  stringSimilarity,
-} from '../services/entityMatch.js'
+import { liveSuggestedProjectMatch, expandMentionContext } from '../services/entityMatch.js'
+import { typeaheadEntities } from '../services/typeahead.js'
 
 export const projectsRouter = Router()
 
@@ -123,6 +120,14 @@ projectsRouter.get('/', (_req, res) => {
   }))
 
   const waiting = buildWaitingWithMatches(db)
+  const pending_proposals_count = rowRequired<{ c: number }>(
+    db
+      .prepare(
+        `SELECT COUNT(*) as c FROM entity_proposals
+         WHERE kind = 'project' AND status = 'pending'`,
+      )
+      .get(),
+  ).c
 
   res.json({
     profiles,
@@ -130,6 +135,7 @@ projectsRouter.get('/', (_req, res) => {
     projects: profiles,
     waiting_count: waiting.length,
     profile_count: profiles.length,
+    pending_proposals_count,
   })
 })
 
@@ -147,14 +153,23 @@ projectsRouter.get('/pending', (_req, res) => {
 
   const roster = listMasterProjects(db)
   const getEntry = db.prepare(
-    `SELECT id, title, status FROM entries WHERE id = ?`,
+    `SELECT id, title, status, content_raw, source_type, original_filename
+     FROM entries WHERE id = ?`,
   )
 
   res.json({
     proposals: proposals.map((p) => {
-      const entry = row<Pick<Entry, 'id' | 'title' | 'status'>>(
-        getEntry.get(p.entry_id),
-      )
+      const entry = row<
+        Pick<
+          Entry,
+          | 'id'
+          | 'title'
+          | 'status'
+          | 'content_raw'
+          | 'source_type'
+          | 'original_filename'
+        >
+      >(getEntry.get(p.entry_id))
       const meta = parseMeta(p.suggested_meta)
 
       let suggested_match: {
@@ -183,11 +198,28 @@ projectsRouter.get('/pending', (_req, res) => {
         suggested_match = liveSuggestedProjectMatch(p.suggested_name, roster)
       }
 
+      const evidence_parsed = parseEvidence(p.evidence)
+      const context = expandMentionContext(
+        entry?.content_raw,
+        p.suggested_name,
+      )
+
       return {
         ...p,
         meta,
-        evidence_parsed: parseEvidence(p.evidence),
-        entry: entry ?? null,
+        evidence_parsed: {
+          ...evidence_parsed,
+          context: context || evidence_parsed.snippet || '',
+        },
+        entry: entry
+          ? {
+              id: entry.id,
+              title: entry.title,
+              status: entry.status,
+              source_type: entry.source_type,
+              original_filename: entry.original_filename,
+            }
+          : null,
         suggested_match,
       }
     }),
@@ -276,44 +308,60 @@ projectsRouter.get('/search', async (req, res) => {
     return
   }
 
-  const db = getDb()
-  const masters = listMasterProjects(db)
-  const byId = new Map(masters.map((p) => [p.id, p]))
+  const mode = String(req.query.mode ?? 'lexical').toLowerCase()
+  const lexical = typeaheadEntities(q, {
+    kinds: ['project'],
+    limit: 30,
+    scope: 'masters',
+  })
   const scores = new Map<string, number>()
-  const qNorm = normalizeName(q)
+  for (const hit of lexical) scores.set(hit.id, hit.score)
 
-  for (const p of masters) {
-    let best = stringSimilarity(qNorm, normalizeName(p.title))
-    for (const a of aliasesList(p)) {
-      best = Math.max(best, stringSimilarity(qNorm, normalizeName(a)))
+  if (mode === 'semantic' || mode === 'hybrid') {
+    try {
+      const similar = await searchSimilar(q, { types: ['project'], limit: 40 })
+      const masters = new Set(listMasterProjects(getDb()).map((p) => p.id))
+      for (const hit of similar) {
+        if (!masters.has(hit.object_id)) continue
+        const prev = scores.get(hit.object_id) ?? 0
+        scores.set(hit.object_id, Math.max(prev, hit.score))
+      }
+    } catch (err) {
+      console.warn('[projects/search] embedding fallback:', err)
     }
-    if (best >= 0.35) scores.set(p.id, best)
   }
 
-  try {
-    const similar = await searchSimilar(q, { types: ['project'], limit: 40 })
-    for (const hit of similar) {
-      if (!byId.has(hit.object_id)) continue
-      const prev = scores.get(hit.object_id) ?? 0
-      scores.set(hit.object_id, Math.max(prev, hit.score))
-    }
-  } catch (err) {
-    console.warn('[projects/search] embedding fallback:', err)
-  }
+  const db = getDb()
+  const ids = [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30)
+    .map(([id]) => id)
 
-  const results = [...scores.entries()]
-    .map(([id, score]) => {
-      const p = byId.get(id)!
+  const results = ids
+    .map((id) => {
+      const lex = lexical.find((h) => h.id === id)
+      if (lex) {
+        return {
+          id: lex.id,
+          title: lex.label,
+          category: lex.subtitle,
+          aliases_list: lex.aliases,
+          score: Math.round((scores.get(id) ?? lex.score) * 1000) / 1000,
+        }
+      }
+      const p = row<Project>(
+        db.prepare(`SELECT * FROM projects WHERE id = ?`).get(id),
+      )
+      if (!p) return null
       return {
         id: p.id,
         title: p.title,
         category: normalizeProjectKind(p.category),
         aliases_list: aliasesList(p),
-        score: Math.round(score * 1000) / 1000,
+        score: Math.round((scores.get(id) ?? 0) * 1000) / 1000,
       }
     })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 30)
+    .filter((x): x is NonNullable<typeof x> => x !== null)
 
   res.json({ query: q, results })
 })
@@ -714,6 +762,7 @@ projectsRouter.delete('/:id', (req, res) => {
     db.prepare(`DELETE FROM project_aliases WHERE project_id = ?`).run(
       existing.id,
     )
+    removeProjectFts(existing.id)
     db.prepare(
       `DELETE FROM embeddings WHERE object_type = 'project' AND object_id = ?`,
     ).run(existing.id)

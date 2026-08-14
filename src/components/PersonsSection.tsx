@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../services/api'
 import type {
+  Agrupacion,
+  AgrupacionGeneratedMeta,
+  AgrupacionMember,
   EntityLink,
   EntityProposalView,
   Person,
@@ -14,10 +17,15 @@ import type {
 } from '../types'
 import { downloadJson } from '../utils/downloadJson'
 import { SuggestedLinksTray } from './SuggestedLinksTray'
+import { NerValidationDeck } from './NerValidationDeck'
 
 interface Props {
   refreshKey: number
   onChanged?: () => void
+  /** Controlado por EntityHub: perfiles | agrupaciones */
+  mode?: 'perfiles' | 'agrupaciones'
+  /** Sin wrapper entity-stage ni switch de modo (lo pone EntityHub) */
+  embedded?: boolean
 }
 
 const PROFILE_KINDS: PersonKind[] = ['fisica', 'juridica', 'ficticia']
@@ -71,7 +79,12 @@ function initials(name: string): string {
   return `${parts[0]![0] ?? ''}${parts[1]![0] ?? ''}`.toUpperCase()
 }
 
-export function PersonsSection({ refreshKey, onChanged }: Props) {
+export function PersonsSection({
+  refreshKey,
+  onChanged,
+  mode: modeProp,
+  embedded = false,
+}: Props) {
   const [profiles, setProfiles] = useState<Person[]>([])
   const [waiting, setWaiting] = useState<Person[]>([])
   const [proposals, setProposals] = useState<EntityProposalView[]>([])
@@ -91,6 +104,7 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
   const [status, setStatus] = useState<string | null>(null)
   const [waitingOpen, setWaitingOpen] = useState(true)
   const [validatorOpen, setValidatorOpen] = useState(false)
+  const [deckOpen, setDeckOpen] = useState(false)
 
   const [formName, setFormName] = useState('')
   const [formKind, setFormKind] = useState<PersonKind>('fisica')
@@ -114,20 +128,70 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
   )
   const [semanticBusy, setSemanticBusy] = useState(false)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  type PersonasMode = 'perfiles' | 'agrupaciones'
+  const [internalMode, setInternalMode] = useState<PersonasMode>('perfiles')
+  const personasMode: PersonasMode = modeProp ?? internalMode
+  const setPersonasMode = (m: PersonasMode) => {
+    if (modeProp === undefined) setInternalMode(m)
+  }
+  const [agrupaciones, setAgrupaciones] = useState<Agrupacion[]>([])
+  const [selectedAgrupacionId, setSelectedAgrupacionId] = useState<string | null>(
+    null,
+  )
+  const [agrupacionMembers, setAgrupacionMembers] = useState<
+    AgrupacionMember[]
+  >([])
+  const [agrupacionInspectorOpen, setAgrupacionInspectorOpen] = useState(false)
+  const [agrupacionEditingId, setAgrupacionEditingId] = useState<string | null>(
+    null,
+  )
+  const [agrupFormName, setAgrupFormName] = useState('')
+  const [agrupFormNotes, setAgrupFormNotes] = useState('')
+  const [agrupGeneratedMeta, setAgrupGeneratedMeta] =
+    useState<AgrupacionGeneratedMeta | null>(null)
+  const [agrupMemberPick, setAgrupMemberPick] = useState('')
+  const [agrupProcessBusy, setAgrupProcessBusy] = useState(false)
+  const [personAgrupaciones, setPersonAgrupaciones] = useState<Agrupacion[]>([])
+  const [addToAgrupacionId, setAddToAgrupacionId] = useState('')
+
+  const selectedIdRef = useRef(selectedId)
+  const selectedAgrupacionIdRef = useRef(selectedAgrupacionId)
+  const hasLoadedRef = useRef(false)
+  const proposalInFlightRef = useRef(new Set<string>())
+  const loadGenRef = useRef(0)
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId
+  }, [selectedId])
+  useEffect(() => {
+    selectedAgrupacionIdRef.current = selectedAgrupacionId
+  }, [selectedAgrupacionId])
+
+  const load = useCallback(async (opts?: { quiet?: boolean }) => {
+    const quiet = opts?.quiet ?? false
+    const gen = ++loadGenRef.current
+    if (!quiet) setLoading(true)
+    if (!quiet) setError(null)
     try {
-      const [roster, pending, projectsMap] = await Promise.all([
+      const [roster, pending, projectsMap, agrupRoster] = await Promise.all([
         api.listPersons(),
         api.getPendingPersons(),
         api.listProjects(),
+        api.listAgrupaciones(),
       ])
-      setProfiles(roster.profiles ?? roster.persons ?? [])
+      if (gen !== loadGenRef.current) return
+
+      const nextProfiles = roster.profiles ?? roster.persons ?? []
+      setProfiles(nextProfiles)
       setWaiting(roster.waiting ?? [])
       setOperatorId(roster.operator_id ?? null)
       setAllProjects(projectsMap.projects)
-      setProposals(pending.proposals)
+      // No pisar menciones que el usuario ya resolvió y siguen in-flight
+      const inFlight = proposalInFlightRef.current
+      setProposals(
+        pending.proposals.filter((p) => !inFlight.has(p.id)),
+      )
+      setAgrupaciones(agrupRoster.agrupaciones ?? [])
       setDraftNames((prev) => {
         const next = { ...prev }
         for (const p of pending.proposals) {
@@ -152,27 +216,80 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
         }
         return next
       })
-      if (
-        selectedId &&
-        !(roster.profiles ?? roster.persons ?? []).some(
-          (p) => p.id === selectedId,
-        )
-      ) {
+      const sid = selectedIdRef.current
+      if (sid && !nextProfiles.some((p) => p.id === sid)) {
         setSelectedId(null)
         setLinks([])
         setRelations([])
         setProjectLinks([])
+        setPersonAgrupaciones([])
+      }
+      const aid = selectedAgrupacionIdRef.current
+      if (
+        aid &&
+        !(agrupRoster.agrupaciones ?? []).some((a) => a.id === aid)
+      ) {
+        setSelectedAgrupacionId(null)
+        setAgrupacionMembers([])
+        setAgrupacionEditingId(null)
+        setAgrupacionInspectorOpen(false)
       }
     } catch (err) {
+      if (gen !== loadGenRef.current) return
       setError(err instanceof Error ? err.message : 'Error al cargar')
     } finally {
-      setLoading(false)
+      if (gen === loadGenRef.current && !quiet) setLoading(false)
     }
-  }, [selectedId])
+  }, [])
 
   useEffect(() => {
-    void load()
+    const delay = hasLoadedRef.current ? 280 : 0
+    const t = window.setTimeout(() => {
+      void load({ quiet: hasLoadedRef.current })
+      hasLoadedRef.current = true
+    }, delay)
+    return () => window.clearTimeout(t)
   }, [load, refreshKey])
+
+  useEffect(() => {
+    if (proposals.length > 0) setValidatorOpen(true)
+  }, [proposals.length])
+
+  const resolveProposal = useCallback(
+    async (
+      id: string,
+      run: () => Promise<void>,
+      successMsg?: string,
+    ) => {
+      if (proposalInFlightRef.current.has(id)) return
+      proposalInFlightRef.current.add(id)
+      setError(null)
+
+      let snapshot: EntityProposalView | undefined
+      setProposals((prev) => {
+        snapshot = prev.find((p) => p.id === id)
+        return prev.filter((p) => p.id !== id)
+      })
+
+      try {
+        await run()
+        if (successMsg) setStatus(successMsg)
+        // Un solo refresh vía refreshKey (badges + roster); sin await load local
+        onChanged?.()
+      } catch (err) {
+        if (snapshot) {
+          setProposals((prev) => {
+            if (prev.some((p) => p.id === snapshot!.id)) return prev
+            return [snapshot!, ...prev]
+          })
+        }
+        setError(err instanceof Error ? err.message : 'Error')
+      } finally {
+        proposalInFlightRef.current.delete(id)
+      }
+    },
+    [onChanged],
+  )
 
   const matchedWaiting = useMemo(
     () => waiting.filter((w) => w.suggested_match),
@@ -203,29 +320,35 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
       return
     }
     let cancelled = false
+    const ac = new AbortController()
     setSemanticBusy(true)
     const timer = window.setTimeout(() => {
       void (async () => {
         try {
-          const res = await api.searchPersons(q)
+          const res = await api.searchPersons(q, {
+            mode: 'lexical',
+            signal: ac.signal,
+          })
           if (cancelled) return
           setSemanticIds(res.results.map((r) => r.id))
           const scores: Record<string, number> = {}
           for (const r of res.results) scores[r.id] = r.score
           setSemanticScores(scores)
         } catch (err) {
-          if (!cancelled) {
-            setError(
-              err instanceof Error ? err.message : 'Error en búsqueda semántica',
-            )
+          if (cancelled || (err instanceof DOMException && err.name === 'AbortError')) {
+            return
           }
+          setError(
+            err instanceof Error ? err.message : 'Error en búsqueda',
+          )
         } finally {
           if (!cancelled) setSemanticBusy(false)
         }
       })()
-    }, 380)
+    }, 200)
     return () => {
       cancelled = true
+      ac.abort()
       window.clearTimeout(timer)
     }
   }, [semanticQuery])
@@ -251,12 +374,17 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
     setStatus(null)
     setRelTargetId('')
     setProjTargetId('')
+    setAddToAgrupacionId('')
     try {
-      const data = await api.getPerson(id)
+      const [data, backlinks] = await Promise.all([
+        api.getPerson(id),
+        api.listAgrupacionesByPerson(id),
+      ])
       setLinks(data.links)
       setRelations(data.relations ?? [])
       setProjectLinks(data.project_links ?? [])
       setOperatorId(data.operator_id ?? null)
+      setPersonAgrupaciones(backlinks.agrupaciones ?? [])
       setEditingId(id)
       setFormName(data.person.name)
       setFormKind(normalizeKind(data.person.kind))
@@ -278,6 +406,8 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
     setLinks([])
     setRelations([])
     setProjectLinks([])
+    setPersonAgrupaciones([])
+    setAddToAgrupacionId('')
     setInspectorOpen(true)
   }
 
@@ -288,12 +418,244 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
     setLinks([])
     setRelations([])
     setProjectLinks([])
+    setPersonAgrupaciones([])
     setFormName(w.name)
     setFormKind(normalizeKind(w.kind))
     setFormAliases((w.aliases_list ?? []).join(', '))
     setFormNotes(w.notes ?? '')
     setInspectorOpen(true)
     setStatus(`Promover «${w.name}» a perfil maestro`)
+  }
+
+  const parseMetaFromAgrupacion = (
+    a: Agrupacion,
+  ): AgrupacionGeneratedMeta | null => {
+    if (a.generated_meta_parsed) return a.generated_meta_parsed
+    try {
+      const parsed = JSON.parse(a.generated_meta || '{}') as AgrupacionGeneratedMeta
+      if (!parsed || typeof parsed !== 'object') return null
+      return {
+        summary: String(parsed.summary ?? ''),
+        tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
+        themes: Array.isArray(parsed.themes) ? parsed.themes.map(String) : [],
+        related_person_names: Array.isArray(parsed.related_person_names)
+          ? parsed.related_person_names.map(String)
+          : [],
+        related_categories: Array.isArray(parsed.related_categories)
+          ? parsed.related_categories.map(String)
+          : [],
+        inferred_facts: Array.isArray(parsed.inferred_facts)
+          ? parsed.inferred_facts.map(String)
+          : [],
+      }
+    } catch {
+      return null
+    }
+  }
+
+  const selectAgrupacion = async (id: string) => {
+    setSelectedAgrupacionId(id)
+    setAgrupacionInspectorOpen(true)
+    setStatus(null)
+    setAgrupMemberPick('')
+    try {
+      const data = await api.getAgrupacion(id)
+      setAgrupacionEditingId(id)
+      setAgrupFormName(data.agrupacion.name)
+      setAgrupFormNotes(data.agrupacion.notes ?? '')
+      setAgrupacionMembers(data.members)
+      setAgrupGeneratedMeta(parseMetaFromAgrupacion(data.agrupacion))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al abrir agrupación')
+    }
+  }
+
+  const resetAgrupacionForm = () => {
+    setAgrupacionEditingId(null)
+    setSelectedAgrupacionId(null)
+    setAgrupacionMembers([])
+    setAgrupFormName('')
+    setAgrupFormNotes('')
+    setAgrupGeneratedMeta(null)
+    setAgrupMemberPick('')
+    setAgrupacionInspectorOpen(true)
+  }
+
+  const handleSaveAgrupacion = async () => {
+    if (!agrupFormName.trim()) return
+    setStatus(null)
+    try {
+      if (agrupacionEditingId) {
+        const res = await api.updateAgrupacion(agrupacionEditingId, {
+          name: agrupFormName.trim(),
+          notes: agrupFormNotes,
+        })
+        setStatus('Agrupación actualizada')
+        setAgrupaciones((prev) =>
+          prev.map((a) =>
+            a.id === agrupacionEditingId ? { ...a, ...res.agrupacion } : a,
+          ),
+        )
+      } else {
+        const res = await api.createAgrupacion({
+          name: agrupFormName.trim(),
+          notes: agrupFormNotes,
+        })
+        setStatus('Agrupación creada')
+        setAgrupaciones((prev) =>
+          [...prev, res.agrupacion].sort((a, b) =>
+            a.name.localeCompare(b.name, 'es'),
+          ),
+        )
+        await selectAgrupacion(res.agrupacion.id)
+      }
+      onChanged?.()
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al guardar')
+    }
+  }
+
+  const handleDeleteAgrupacion = async () => {
+    if (!agrupacionEditingId) return
+    if (!window.confirm('¿Eliminar esta agrupación y sus membresías?')) return
+    try {
+      await api.deleteAgrupacion(agrupacionEditingId)
+      setStatus('Agrupación eliminada')
+      resetAgrupacionForm()
+      setAgrupacionInspectorOpen(false)
+      onChanged?.()
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al eliminar')
+    }
+  }
+
+  const handleAddAgrupacionMember = async (personId?: string) => {
+    const id = personId || agrupMemberPick
+    if (!agrupacionEditingId || !id) return
+    try {
+      await api.addAgrupacionMember(agrupacionEditingId, id)
+      setAgrupMemberPick('')
+      setStatus('Miembro añadido')
+      await selectAgrupacion(agrupacionEditingId)
+      onChanged?.()
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al vincular')
+    }
+  }
+
+  const handleRemoveAgrupacionMember = async (personId: string) => {
+    if (!agrupacionEditingId) return
+    try {
+      await api.removeAgrupacionMember(agrupacionEditingId, personId)
+      setStatus('Miembro quitado')
+      await selectAgrupacion(agrupacionEditingId)
+      onChanged?.()
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al quitar')
+    }
+  }
+
+  const handleProcessAgrupacion = async () => {
+    if (!agrupacionEditingId) return
+    setAgrupProcessBusy(true)
+    setStatus(null)
+    try {
+      // Guardar notes antes de procesar
+      await api.updateAgrupacion(agrupacionEditingId, {
+        name: agrupFormName.trim() || undefined,
+        notes: agrupFormNotes,
+      })
+      const res = await api.processAgrupacionMeta(agrupacionEditingId)
+      setAgrupGeneratedMeta(res.generated_meta)
+      setAgrupacionMembers(res.members)
+      setStatus('Metadata generada')
+      onChanged?.()
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al generar metadata')
+    } finally {
+      setAgrupProcessBusy(false)
+    }
+  }
+
+  const handleAddPersonToAgrupacion = async () => {
+    if (!editingId || !addToAgrupacionId) return
+    try {
+      await api.addAgrupacionMember(addToAgrupacionId, editingId)
+      setAddToAgrupacionId('')
+      setStatus('Añadido a agrupación')
+      const backlinks = await api.listAgrupacionesByPerson(editingId)
+      setPersonAgrupaciones(backlinks.agrupaciones ?? [])
+      onChanged?.()
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al añadir')
+    }
+  }
+
+  const handleRemovePersonFromAgrupacion = async (agrupacionId: string) => {
+    if (!editingId) return
+    try {
+      await api.removeAgrupacionMember(agrupacionId, editingId)
+      setStatus('Quitado de agrupación')
+      const backlinks = await api.listAgrupacionesByPerson(editingId)
+      setPersonAgrupaciones(backlinks.agrupaciones ?? [])
+      onChanged?.()
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al quitar')
+    }
+  }
+
+  const switchPersonasMode = (mode: PersonasMode) => {
+    setPersonasMode(mode)
+    if (mode === 'agrupaciones') {
+      setInspectorOpen(false)
+      setSelectedId(null)
+    } else {
+      setAgrupacionInspectorOpen(false)
+      setSelectedAgrupacionId(null)
+    }
+  }
+
+  useEffect(() => {
+    if (modeProp === undefined) return
+    if (modeProp === 'agrupaciones') {
+      setInspectorOpen(false)
+      setSelectedId(null)
+    } else {
+      setAgrupacionInspectorOpen(false)
+      setSelectedAgrupacionId(null)
+    }
+  }, [modeProp])
+
+  const candidateMembers = useMemo(() => {
+    const memberIds = new Set(agrupacionMembers.map((m) => m.person_id))
+    const list: Array<Person & { _bucket: 'perfil' | 'waiting' }> = [
+      ...profiles
+        .filter((p) => !memberIds.has(p.id))
+        .map((p) => ({ ...p, _bucket: 'perfil' as const })),
+      ...waiting
+        .filter((p) => !memberIds.has(p.id))
+        .map((p) => ({ ...p, _bucket: 'waiting' as const })),
+    ]
+    return list.sort((a, b) => a.name.localeCompare(b.name, 'es'))
+  }, [profiles, waiting, agrupacionMembers])
+
+  const hasMetaContent = (meta: AgrupacionGeneratedMeta | null) => {
+    if (!meta) return false
+    return Boolean(
+      meta.summary ||
+        meta.tags.length ||
+        meta.themes.length ||
+        meta.related_person_names.length ||
+        meta.related_categories.length ||
+        meta.inferred_facts.length,
+    )
   }
 
   const handleSave = async () => {
@@ -427,25 +789,21 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
     const name = (draftNames[p.id] ?? p.suggested_name).trim()
     const kind = draftKinds[p.id] ?? normalizeKind(p.meta.kind)
     if (!name) return
-    setBusyId(p.id)
-    try {
-      const res = await api.approvePersonProposal(p.id, {
-        name,
-        kind,
-        as: 'create',
-      })
-      await load()
-      onChanged?.()
-      setStatus(
-        res.discarded
-          ? `Descartado como ${KIND_LABEL[kind] ?? kind}`
-          : 'Mención → sala de espera',
-      )
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error')
-    } finally {
-      setBusyId(null)
-    }
+    await resolveProposal(
+      p.id,
+      async () => {
+        const res = await api.approvePersonProposal(p.id, {
+          name,
+          kind,
+          as: 'create',
+        })
+        setStatus(
+          res.discarded
+            ? `Descartado como ${KIND_LABEL[kind] ?? kind}`
+            : 'Mención → sala de espera',
+        )
+      },
+    )
   }
 
   const handleLinkProposal = async (
@@ -461,34 +819,23 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
       setError('Elegí un perfil destino')
       return
     }
-    setBusyId(p.id)
-    try {
-      await api.approvePersonProposal(p.id, {
-        name: (draftNames[p.id] ?? p.suggested_name).trim(),
-        matched_entity_id: matched,
-        as: 'link',
-      })
-      await load()
-      onChanged?.()
-      setStatus('Mención vinculada a perfil')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error al vincular')
-    } finally {
-      setBusyId(null)
-    }
+    await resolveProposal(
+      p.id,
+      async () => {
+        await api.approvePersonProposal(p.id, {
+          name: (draftNames[p.id] ?? p.suggested_name).trim(),
+          matched_entity_id: matched,
+          as: 'link',
+        })
+      },
+      'Mención vinculada a perfil',
+    )
   }
 
   const handleReject = async (id: string, reason = 'manual') => {
-    setBusyId(id)
-    try {
+    await resolveProposal(id, async () => {
       await api.rejectPersonProposal(id, reason)
-      await load()
-      onChanged?.()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error')
-    } finally {
-      setBusyId(null)
-    }
+    }, 'Mención descartada')
   }
 
   const handleExportAll = async () => {
@@ -597,9 +944,185 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
       operatorId === editingId)
 
   return (
-    <div className="entity-stage personas-stage">
+    <div className={embedded ? 'entity-stage-body' : 'entity-stage personas-stage'}>
+      {!embedded && (
+      <div className="personas-mode-switch" role="tablist" aria-label="Modo de vista">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={personasMode === 'perfiles'}
+          className={
+            personasMode === 'perfiles'
+              ? 'filter-chip is-active'
+              : 'filter-chip'
+          }
+          onClick={() => switchPersonasMode('perfiles')}
+        >
+          Perfiles
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={personasMode === 'agrupaciones'}
+          className={
+            personasMode === 'agrupaciones'
+              ? 'filter-chip is-active'
+              : 'filter-chip'
+          }
+          onClick={() => switchPersonasMode('agrupaciones')}
+        >
+          Agrupaciones
+          {agrupaciones.length > 0 ? (
+            <span className="nav-badge">{agrupaciones.length}</span>
+          ) : null}
+        </button>
+      </div>
+      )}
+
+      {/* —— Validador NER (menciones pendientes de audio/bookmarks) —— */}
+      <section className="panel entity-panel entity-pending">
+        <div className="panel-head entity-head">
+          <div>
+            <h2>
+              Validador NER
+              {proposals.length > 0 ? (
+                <span className="nav-badge">{proposals.length}</span>
+              ) : null}
+            </h2>
+            <p className="muted mono">
+              Menciones nuevas (audio / criba) · acá llegan las del badge
+            </p>
+          </div>
+          <div className="entity-head-actions">
+            {proposals.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-primary btn-tiny"
+                onClick={() => {
+                  setValidatorOpen(true)
+                  setDeckOpen(true)
+                }}
+              >
+                Validación
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn-tiny btn-ghost"
+              onClick={() => setValidatorOpen((o) => !o)}
+            >
+              {validatorOpen ? 'Plegar' : 'Abrir'}
+            </button>
+          </div>
+        </div>
+
+        {validatorOpen &&
+          (proposals.length === 0 ? (
+            <p className="muted mono">Sin menciones pendientes</p>
+          ) : (
+            <ul className="proposal-list">
+              {proposals.map((p) => {
+                const kind =
+                  draftKinds[p.id] ?? normalizeKind(p.meta.kind)
+                const match = p.suggested_match
+                const isNoise = kind === 'ruido' || kind === 'abstracta'
+                const busy = busyId === p.id
+                return (
+                  <li key={p.id} className="proposal-card">
+                    <div className="proposal-card-head">
+                      <span
+                        className={
+                          match
+                            ? 'badge badge-link'
+                            : isNoise
+                              ? 'badge badge-noise'
+                              : 'badge badge-new'
+                        }
+                      >
+                        {isNoise
+                          ? KIND_LABEL[kind]
+                          : match
+                            ? 'Posible vínculo'
+                            : 'Mención'}
+                      </span>
+                    </div>
+                    <label className="field">
+                      <span className="mono">Mención</span>
+                      <input
+                        value={draftNames[p.id] ?? p.suggested_name}
+                        onChange={(e) =>
+                          setDraftNames((d) => ({
+                            ...d,
+                            [p.id]: e.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="field">
+                      <span className="mono">Clasificar</span>
+                      <select
+                        value={kind}
+                        onChange={(e) =>
+                          setDraftKinds((d) => ({
+                            ...d,
+                            [p.id]: e.target.value as PersonKind,
+                          }))
+                        }
+                      >
+                        <option value="fisica">Física</option>
+                        <option value="juridica">Jurídica</option>
+                        <option value="ficticia">Ficticia</option>
+                        <option value="abstracta">Abstracta</option>
+                        <option value="ruido">Ruido</option>
+                      </select>
+                    </label>
+                    {p.evidence_parsed.snippet && (
+                      <p className="proposal-evidence">
+                        “{p.evidence_parsed.snippet}”
+                      </p>
+                    )}
+                    {match && profiles.some((x) => x.id === match.id) && (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-tiny"
+                        disabled={busy}
+                        onClick={() => void handleLinkProposal(p, match.id)}
+                      >
+                        Vincular a {match.name}
+                      </button>
+                    )}
+                    <div className="actions-row proposal-actions">
+                      <button
+                        type="button"
+                        className="btn btn-tiny btn-ghost danger"
+                        disabled={busy}
+                        onClick={() =>
+                          void handleReject(p.id, isNoise ? kind : 'manual')
+                        }
+                      >
+                        Descartar
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-tiny"
+                        disabled={busy}
+                        onClick={() => void handleCreateNew(p)}
+                      >
+                        {isNoise
+                          ? `Descartar (${KIND_LABEL[kind]})`
+                          : 'A sala de espera'}
+                      </button>
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          ))}
+      </section>
+
       <div className="personas-layout">
-        {/* —— Directorio: perfiles maestros —— */}
+        {personasMode === 'perfiles' ? (
+        /* —— Directorio: perfiles maestros —— */
         <section className="panel entity-panel profiles-directory">
           <div className="panel-head entity-head">
             <div>
@@ -669,8 +1192,8 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
                     type="search"
                     value={semanticQuery}
                     onChange={(e) => setSemanticQuery(e.target.value)}
-                    placeholder="Búsqueda semántica…"
-                    aria-label="Búsqueda semántica de perfiles"
+                    placeholder="Buscar por nombre o alias…"
+                    aria-label="Búsqueda de perfiles"
                   />
                   {semanticBusy && (
                     <span className="semantic-search-hint mono">…</span>
@@ -759,7 +1282,7 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
               {filteredProfiles.length === 0 && (
                 <p className="muted mono">
                   {semanticQuery.trim()
-                    ? 'Sin coincidencias semánticas'
+                    ? 'Sin coincidencias'
                     : 'Nada en este filtro'}
                 </p>
               )}
@@ -1026,9 +1549,347 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
                   </ul>
                 </div>
               )}
+
+              {editingId && !promoteId && (
+                <div className="relation-block">
+                  <h4 className="mono">Agrupaciones</h4>
+                  <div className="relation-add">
+                    <select
+                      value={addToAgrupacionId}
+                      onChange={(e) => setAddToAgrupacionId(e.target.value)}
+                    >
+                      <option value="">— añadir a… —</option>
+                      {agrupaciones
+                        .filter(
+                          (a) =>
+                            !personAgrupaciones.some((pa) => pa.id === a.id),
+                        )
+                        .map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.name}
+                          </option>
+                        ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="btn btn-tiny btn-primary"
+                      disabled={!addToAgrupacionId}
+                      onClick={() => void handleAddPersonToAgrupacion()}
+                    >
+                      Añadir
+                    </button>
+                  </div>
+                  {personAgrupaciones.length === 0 ? (
+                    <p className="muted mono">Sin agrupaciones</p>
+                  ) : (
+                    <ul className="item-edit-list">
+                      {personAgrupaciones.map((a) => (
+                        <li key={a.id} className="mono relation-row">
+                          <span>{a.name}</span>
+                          <button
+                            type="button"
+                            className="btn btn-tiny btn-ghost danger"
+                            onClick={() =>
+                              void handleRemovePersonFromAgrupacion(a.id)
+                            }
+                          >
+                            Quitar
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </section>
+        ) : (
+        /* —— Agrupaciones —— */
+        <section className="panel entity-panel profiles-directory agrupaciones-directory">
+          <div className="panel-head entity-head">
+            <div>
+              <h2>Agrupaciones</h2>
+              <p className="muted mono">
+                Contenedores many-to-many · perfiles y entidades validadas
+                {agrupaciones.length > 0 ? ` · ${agrupaciones.length}` : ''}
+              </p>
+            </div>
+            <div className="entity-head-actions">
+              <button
+                type="button"
+                className="btn btn-tiny btn-primary"
+                onClick={resetAgrupacionForm}
+              >
+                Nueva agrupación
+              </button>
+            </div>
+          </div>
+
+          {loading && agrupaciones.length === 0 ? (
+            <p className="muted mono">Cargando…</p>
+          ) : agrupaciones.length === 0 ? (
+            <p className="muted mono profiles-empty">
+              Sin agrupaciones. Creá una (p. ej. Pensadores, Argentinos,
+              Amigos, Tecnología).
+            </p>
+          ) : (
+            <div className="profile-card-grid">
+              {agrupaciones.map((a) => (
+                <button
+                  key={a.id}
+                  type="button"
+                  className={[
+                    'profile-card',
+                    selectedAgrupacionId === a.id ? 'is-active' : '',
+                    dropTargetId === a.id ? 'is-drop-target' : '',
+                    dragWaitingIds.length > 0 ? 'is-droppable' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
+                  onClick={() => void selectAgrupacion(a.id)}
+                  onDragOver={(e) => {
+                    if (dragWaitingIds.length === 0) return
+                    e.preventDefault()
+                    e.dataTransfer.dropEffect = 'link'
+                    setDropTargetId(a.id)
+                  }}
+                  onDragLeave={() => {
+                    setDropTargetId((cur) => (cur === a.id ? null : cur))
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault()
+                    let ids: string[] = []
+                    try {
+                      const raw = e.dataTransfer.getData('text/waiting-ids')
+                      if (raw) ids = JSON.parse(raw) as string[]
+                    } catch {
+                      /* ignore */
+                    }
+                    setDropTargetId(null)
+                    setDragWaitingIds([])
+                    if (ids.length === 0) return
+                    void (async () => {
+                      for (const pid of ids) {
+                        try {
+                          await api.addAgrupacionMember(a.id, pid)
+                        } catch {
+                          /* skip duplicates */
+                        }
+                      }
+                      setStatus(
+                        `Añadidos ${ids.length} a «${a.name}»`,
+                      )
+                      await selectAgrupacion(a.id)
+                      onChanged?.()
+                      await load()
+                    })()
+                  }}
+                >
+                  <span className="profile-card-avatar" aria-hidden>
+                    {initials(a.name)}
+                  </span>
+                  <span className="profile-card-body">
+                    <span className="profile-card-name">{a.name}</span>
+                    <span className="profile-card-meta mono">
+                      {a.member_count ?? 0} miembro
+                      {(a.member_count ?? 0) === 1 ? '' : 's'}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {agrupacionInspectorOpen && (
+            <div className="profile-inspector">
+              <h3 className="mono">
+                {agrupacionEditingId ? 'Inspector' : 'Crear agrupación'}
+              </h3>
+              <label className="field">
+                <span className="mono">Nombre</span>
+                <input
+                  value={agrupFormName}
+                  onChange={(e) => setAgrupFormName(e.target.value)}
+                  placeholder="Pensadores y escritores"
+                />
+              </label>
+              <label className="field">
+                <span className="mono">Notas (texto libre)</span>
+                <textarea
+                  value={agrupFormNotes}
+                  onChange={(e) => setAgrupFormNotes(e.target.value)}
+                  rows={6}
+                  placeholder={
+                    'Criterio, bullets, origen compartido, vínculos…\nEl sistema generará metadata a partir de esto.'
+                  }
+                />
+              </label>
+
+              {agrupacionEditingId && (
+                <div className="relation-block">
+                  <h4 className="mono">Miembros</h4>
+                  <div className="relation-add">
+                    <select
+                      value={agrupMemberPick}
+                      onChange={(e) => setAgrupMemberPick(e.target.value)}
+                    >
+                      <option value="">— vincular persona —</option>
+                      {candidateMembers.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                          {p._bucket === 'waiting'
+                            ? ' · ent. validada'
+                            : ' · perfil'}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="btn btn-tiny btn-primary"
+                      disabled={!agrupMemberPick}
+                      onClick={() => void handleAddAgrupacionMember()}
+                    >
+                      Vincular
+                    </button>
+                  </div>
+                  {agrupacionMembers.length === 0 ? (
+                    <p className="muted mono">
+                      Sin miembros · arrastrá desde sala de espera o elegí
+                      arriba
+                    </p>
+                  ) : (
+                    <ul className="item-edit-list agrupacion-member-list">
+                      {agrupacionMembers.map((m) => (
+                        <li key={m.id} className="mono relation-row">
+                          <span>
+                            {m.person_name ?? m.person_id}
+                            <span className="muted">
+                              {' '}
+                              ·{' '}
+                              {m.person_source === 'manual'
+                                ? 'perfil'
+                                : 'ent. validada'}
+                            </span>
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-tiny btn-ghost danger"
+                            onClick={() =>
+                              void handleRemoveAgrupacionMember(m.person_id)
+                            }
+                          >
+                            Quitar
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              {agrupacionEditingId && (
+                <div className="relation-block agrupacion-meta-block">
+                  <div className="agrupacion-meta-head">
+                    <h4 className="mono">Metadata generada</h4>
+                    <button
+                      type="button"
+                      className="btn btn-tiny btn-primary"
+                      disabled={agrupProcessBusy || !agrupFormName.trim()}
+                      onClick={() => void handleProcessAgrupacion()}
+                    >
+                      {agrupProcessBusy ? 'Generando…' : 'Generar metadata'}
+                    </button>
+                  </div>
+                  {!hasMetaContent(agrupGeneratedMeta) ? (
+                    <p className="muted mono">
+                      Todavía no hay metadata. Escribí notas y generá.
+                    </p>
+                  ) : (
+                    <div className="agrupacion-meta-view">
+                      {agrupGeneratedMeta?.summary ? (
+                        <p className="agrupacion-meta-summary">
+                          {agrupGeneratedMeta.summary}
+                        </p>
+                      ) : null}
+                      {agrupGeneratedMeta &&
+                        agrupGeneratedMeta.tags.length > 0 && (
+                          <div className="agrupacion-meta-chips">
+                            {agrupGeneratedMeta.tags.map((t) => (
+                              <span key={`tag-${t}`} className="filter-chip">
+                                {t}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      {agrupGeneratedMeta &&
+                        agrupGeneratedMeta.themes.length > 0 && (
+                          <p className="mono muted">
+                            Temas · {agrupGeneratedMeta.themes.join(' · ')}
+                          </p>
+                        )}
+                      {agrupGeneratedMeta &&
+                        agrupGeneratedMeta.related_categories.length > 0 && (
+                          <p className="mono muted">
+                            Categorías ·{' '}
+                            {agrupGeneratedMeta.related_categories.join(' · ')}
+                          </p>
+                        )}
+                      {agrupGeneratedMeta &&
+                        agrupGeneratedMeta.related_person_names.length >
+                          0 && (
+                          <p className="mono muted">
+                            Personas ·{' '}
+                            {agrupGeneratedMeta.related_person_names.join(
+                              ' · ',
+                            )}
+                          </p>
+                        )}
+                      {agrupGeneratedMeta &&
+                        agrupGeneratedMeta.inferred_facts.length > 0 && (
+                          <ul className="agrupacion-facts">
+                            {agrupGeneratedMeta.inferred_facts.map((f) => (
+                              <li key={f}>{f}</li>
+                            ))}
+                          </ul>
+                        )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="actions-row">
+                {agrupacionEditingId && (
+                  <button
+                    type="button"
+                    className="btn btn-tiny btn-ghost danger"
+                    onClick={() => void handleDeleteAgrupacion()}
+                  >
+                    Eliminar
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-tiny btn-ghost"
+                  onClick={() => {
+                    setAgrupacionInspectorOpen(false)
+                  }}
+                >
+                  Cerrar
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-tiny"
+                  disabled={!agrupFormName.trim()}
+                  onClick={() => void handleSaveAgrupacion()}
+                >
+                  {agrupacionEditingId ? 'Guardar' : 'Crear agrupación'}
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+        )}
 
         {/* —— Sala de espera + bandeja grafo —— */}
         <div className="personas-side-rail">
@@ -1082,7 +1943,9 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
               ) : (
                 <>
                   <p className="muted mono waiting-hint-line">
-                    Ctrl+clic para multiselección · arrastrá al perfil
+                    {personasMode === 'agrupaciones'
+                      ? 'Ctrl+clic para multiselección · arrastrá a una agrupación'
+                      : 'Ctrl+clic para multiselección · arrastrá al perfil'}
                   </p>
                   <ul className="waiting-pill-list">
                     {waiting.map((w) => {
@@ -1242,131 +2105,41 @@ export function PersonsSection({ refreshKey, onChanged }: Props) {
         </div>
       </div>
 
-      {/* —— Validador NER (menciones crudas pendientes) —— */}
-      <section className="panel entity-panel entity-pending">
-        <div className="panel-head entity-head">
-          <div>
-            <h2>Validador NER</h2>
-            <p className="muted mono">
-              Menciones nuevas post-audio
-              {proposals.length > 0 ? ` · ${proposals.length}` : ''}
-            </p>
-          </div>
-          <button
-            type="button"
-            className="btn btn-tiny btn-ghost"
-            onClick={() => setValidatorOpen((o) => !o)}
-          >
-            {validatorOpen ? 'Plegar' : 'Abrir'}
-          </button>
-        </div>
-
-        {validatorOpen &&
-          (proposals.length === 0 ? (
-            <p className="muted mono">Sin menciones pendientes</p>
-          ) : (
-            <ul className="proposal-list">
-              {proposals.map((p) => {
-                const kind =
-                  draftKinds[p.id] ?? normalizeKind(p.meta.kind)
-                const match = p.suggested_match
-                const isNoise = kind === 'ruido' || kind === 'abstracta'
-                const busy = busyId === p.id
-                return (
-                  <li key={p.id} className="proposal-card">
-                    <div className="proposal-card-head">
-                      <span
-                        className={
-                          match
-                            ? 'badge badge-link'
-                            : isNoise
-                              ? 'badge badge-noise'
-                              : 'badge badge-new'
-                        }
-                      >
-                        {isNoise
-                          ? KIND_LABEL[kind]
-                          : match
-                            ? 'Posible vínculo'
-                            : 'Mención'}
-                      </span>
-                    </div>
-                    <label className="field">
-                      <span className="mono">Mención</span>
-                      <input
-                        value={draftNames[p.id] ?? p.suggested_name}
-                        onChange={(e) =>
-                          setDraftNames((d) => ({
-                            ...d,
-                            [p.id]: e.target.value,
-                          }))
-                        }
-                      />
-                    </label>
-                    <label className="field">
-                      <span className="mono">Clasificar</span>
-                      <select
-                        value={kind}
-                        onChange={(e) =>
-                          setDraftKinds((d) => ({
-                            ...d,
-                            [p.id]: e.target.value as PersonKind,
-                          }))
-                        }
-                      >
-                        <option value="fisica">Física</option>
-                        <option value="juridica">Jurídica</option>
-                        <option value="ficticia">Ficticia</option>
-                        <option value="abstracta">Abstracta</option>
-                        <option value="ruido">Ruido</option>
-                      </select>
-                    </label>
-                    {p.evidence_parsed.snippet && (
-                      <p className="proposal-evidence">
-                        “{p.evidence_parsed.snippet}”
-                      </p>
-                    )}
-                    {match && profiles.some((x) => x.id === match.id) && (
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-tiny"
-                        disabled={busy}
-                        onClick={() => void handleLinkProposal(p, match.id)}
-                      >
-                        Vincular a {match.name}
-                      </button>
-                    )}
-                    <div className="actions-row proposal-actions">
-                      <button
-                        type="button"
-                        className="btn btn-tiny btn-ghost danger"
-                        disabled={busy}
-                        onClick={() =>
-                          void handleReject(p.id, isNoise ? kind : 'manual')
-                        }
-                      >
-                        Descartar
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-tiny"
-                        disabled={busy}
-                        onClick={() => void handleCreateNew(p)}
-                      >
-                        {isNoise
-                          ? `Descartar (${KIND_LABEL[kind]})`
-                          : 'A sala de espera'}
-                      </button>
-                    </div>
-                  </li>
-                )
-              })}
-            </ul>
-          ))}
-      </section>
-
       {status && <p className="status-line ok">{status}</p>}
       {error && <p className="status-line err">{error}</p>}
+
+      <NerValidationDeck
+        open={deckOpen}
+        onClose={() => setDeckOpen(false)}
+        variant="person"
+        proposals={proposals}
+        names={draftNames}
+        classes={draftKinds}
+        classOptions={[
+          { value: 'fisica', label: 'Física' },
+          { value: 'juridica', label: 'Jurídica' },
+          { value: 'ficticia', label: 'Ficticia' },
+          { value: 'abstracta', label: 'Abstracta' },
+          { value: 'ruido', label: 'Ruido' },
+        ]}
+        onNameChange={(id, value) =>
+          setDraftNames((d) => ({ ...d, [id]: value }))
+        }
+        onClassChange={(id, value) =>
+          setDraftKinds((d) => ({ ...d, [id]: value as PersonKind }))
+        }
+        onDiscard={async (p) => {
+          const kind = draftKinds[p.id] ?? normalizeKind(p.meta.kind)
+          const isNoise = kind === 'ruido' || kind === 'abstracta'
+          await handleReject(p.id, isNoise ? kind : 'manual')
+        }}
+        onWaiting={async (p) => {
+          await handleCreateNew(p)
+        }}
+        onLink={async (p, targetId) => {
+          await handleLinkProposal(p, targetId)
+        }}
+      />
     </div>
   )
 }

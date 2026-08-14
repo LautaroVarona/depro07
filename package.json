@@ -11,13 +11,16 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "multer": "^2.0.1",
+    "pdfjs-dist": "^6.2.108",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-force-graph-2d": "^1.29.1"
+    "react-force-graph-2d": "^1.29.1",
+    "react-force-graph-3d": "^1.29.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.14",

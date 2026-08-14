@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../services/api'
 import type {
   EntityLink,
@@ -12,10 +12,13 @@ import type {
 } from '../types'
 import { downloadJson } from '../utils/downloadJson'
 import { SuggestedLinksTray } from './SuggestedLinksTray'
+import { NerValidationDeck } from './NerValidationDeck'
 
 interface Props {
   refreshKey: number
   onChanged?: () => void
+  /** Sin wrapper entity-stage (lo pone EntityHub) */
+  embedded?: boolean
 }
 
 const KIND_LABEL: Record<ProjectKind, string> = {
@@ -45,7 +48,11 @@ function initials(title: string): string {
   return `${parts[0]![0] ?? ''}${parts[1]![0] ?? ''}`.toUpperCase()
 }
 
-export function ProjectsSection({ refreshKey, onChanged }: Props) {
+export function ProjectsSection({
+  refreshKey,
+  onChanged,
+  embedded = false,
+}: Props) {
   const [profiles, setProfiles] = useState<Project[]>([])
   const [waiting, setWaiting] = useState<Project[]>([])
   const [proposals, setProposals] = useState<EntityProposalView[]>([])
@@ -58,6 +65,7 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
   const [statusMsg, setStatusMsg] = useState<string | null>(null)
   const [waitingOpen, setWaitingOpen] = useState(true)
   const [validatorOpen, setValidatorOpen] = useState(false)
+  const [deckOpen, setDeckOpen] = useState(false)
   const [kindFilter, setKindFilter] = useState<ProjectKind | 'all'>('all')
 
   const [formTitle, setFormTitle] = useState('')
@@ -95,19 +103,36 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
   const [personPick, setPersonPick] = useState('')
   const [personRole, setPersonRole] = useState<PersonProjectRole>('miembro')
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  const selectedIdRef = useRef(selectedId)
+  const hasLoadedRef = useRef(false)
+  const proposalInFlightRef = useRef(new Set<string>())
+  const loadGenRef = useRef(0)
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId
+  }, [selectedId])
+
+  const load = useCallback(async (opts?: { quiet?: boolean }) => {
+    const quiet = opts?.quiet ?? false
+    const gen = ++loadGenRef.current
+    if (!quiet) setLoading(true)
+    if (!quiet) setError(null)
     try {
       const [map, pending, personsMap] = await Promise.all([
         api.listProjects(),
         api.getPendingProjects(),
         api.listPersons(),
       ])
-      setProfiles(map.profiles ?? map.projects ?? [])
+      if (gen !== loadGenRef.current) return
+
+      const nextProfiles = map.profiles ?? map.projects ?? []
+      setProfiles(nextProfiles)
       setWaiting(map.waiting ?? [])
       setPersons(personsMap.profiles ?? personsMap.persons ?? [])
-      setProposals(pending.proposals)
+      const inFlight = proposalInFlightRef.current
+      setProposals(
+        pending.proposals.filter((p) => !inFlight.has(p.id)),
+      )
       setDraftTitles((prev) => {
         const next = { ...prev }
         for (const p of pending.proposals) {
@@ -153,24 +178,67 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
         }
         return next
       })
-      if (
-        selectedId &&
-        !(map.profiles ?? map.projects ?? []).some((p) => p.id === selectedId)
-      ) {
+      const sid = selectedIdRef.current
+      if (sid && !nextProfiles.some((p) => p.id === sid)) {
         setSelectedId(null)
         setLinks([])
         setPeople([])
       }
     } catch (err) {
+      if (gen !== loadGenRef.current) return
       setError(err instanceof Error ? err.message : 'Error al cargar')
     } finally {
-      setLoading(false)
+      if (gen === loadGenRef.current && !quiet) setLoading(false)
     }
-  }, [selectedId])
+  }, [])
 
   useEffect(() => {
-    void load()
+    const delay = hasLoadedRef.current ? 280 : 0
+    const t = window.setTimeout(() => {
+      void load({ quiet: hasLoadedRef.current })
+      hasLoadedRef.current = true
+    }, delay)
+    return () => window.clearTimeout(t)
   }, [load, refreshKey])
+
+  useEffect(() => {
+    if (proposals.length > 0) setValidatorOpen(true)
+  }, [proposals.length])
+
+  const resolveProposal = useCallback(
+    async (
+      id: string,
+      run: () => Promise<void>,
+      successMsg?: string,
+    ) => {
+      if (proposalInFlightRef.current.has(id)) return
+      proposalInFlightRef.current.add(id)
+      setError(null)
+
+      let snapshot: EntityProposalView | undefined
+      setProposals((prev) => {
+        snapshot = prev.find((p) => p.id === id)
+        return prev.filter((p) => p.id !== id)
+      })
+
+      try {
+        await run()
+        if (successMsg) setStatusMsg(successMsg)
+        onChanged?.()
+      } catch (err) {
+        if (snapshot) {
+          setProposals((prev) => {
+            if (prev.some((p) => p.id === snapshot!.id)) return prev
+            return [snapshot!, ...prev]
+          })
+        }
+        setError(err instanceof Error ? err.message : 'Error')
+      } finally {
+        proposalInFlightRef.current.delete(id)
+      }
+    },
+    [onChanged],
+  )
 
   const matchedWaiting = useMemo(
     () => waiting.filter((w) => w.suggested_match),
@@ -203,29 +271,35 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
       return
     }
     let cancelled = false
+    const ac = new AbortController()
     setSemanticBusy(true)
     const timer = window.setTimeout(() => {
       void (async () => {
         try {
-          const res = await api.searchProjects(q)
+          const res = await api.searchProjects(q, {
+            mode: 'lexical',
+            signal: ac.signal,
+          })
           if (cancelled) return
           setSemanticIds(res.results.map((r) => r.id))
           const scores: Record<string, number> = {}
           for (const r of res.results) scores[r.id] = r.score
           setSemanticScores(scores)
         } catch (err) {
-          if (!cancelled) {
-            setError(
-              err instanceof Error ? err.message : 'Error en búsqueda semántica',
-            )
+          if (cancelled || (err instanceof DOMException && err.name === 'AbortError')) {
+            return
           }
+          setError(
+            err instanceof Error ? err.message : 'Error en búsqueda',
+          )
         } finally {
           if (!cancelled) setSemanticBusy(false)
         }
       })()
-    }, 380)
+    }, 200)
     return () => {
       cancelled = true
+      ac.abort()
       window.clearTimeout(timer)
     }
   }, [semanticQuery])
@@ -430,23 +504,19 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
   const handleCreateNew = async (p: EntityProposalView) => {
     const title = (draftTitles[p.id] ?? p.suggested_name).trim()
     if (!title) return
-    setBusyId(p.id)
-    try {
-      await api.approveProjectProposal(p.id, {
-        title,
-        category: draftCategories[p.id] ?? 'proyecto',
-        status: draftStatuses[p.id] ?? 'emergente',
-        tactical_focus: draftFocuses[p.id] || undefined,
-        as: 'create',
-      })
-      await load()
-      onChanged?.()
-      setStatusMsg('Mención → sala de espera')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error')
-    } finally {
-      setBusyId(null)
-    }
+    await resolveProposal(
+      p.id,
+      async () => {
+        await api.approveProjectProposal(p.id, {
+          title,
+          category: draftCategories[p.id] ?? 'proyecto',
+          status: draftStatuses[p.id] ?? 'emergente',
+          tactical_focus: draftFocuses[p.id] || undefined,
+          as: 'create',
+        })
+      },
+      'Mención → sala de espera',
+    )
   }
 
   const handleLinkProposal = async (
@@ -459,34 +529,27 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
       setError('Elegí un proyecto destino')
       return
     }
-    setBusyId(p.id)
-    try {
-      await api.approveProjectProposal(p.id, {
-        title: (draftTitles[p.id] ?? p.suggested_name).trim(),
-        matched_entity_id: matched,
-        as: 'link',
-      })
-      await load()
-      onChanged?.()
-      setStatusMsg('Mención vinculada a maestro')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error al vincular')
-    } finally {
-      setBusyId(null)
-    }
+    await resolveProposal(
+      p.id,
+      async () => {
+        await api.approveProjectProposal(p.id, {
+          title: (draftTitles[p.id] ?? p.suggested_name).trim(),
+          matched_entity_id: matched,
+          as: 'link',
+        })
+      },
+      'Mención vinculada a maestro',
+    )
   }
 
   const handleReject = async (id: string) => {
-    setBusyId(id)
-    try {
-      await api.rejectProjectProposal(id)
-      await load()
-      onChanged?.()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error')
-    } finally {
-      setBusyId(null)
-    }
+    await resolveProposal(
+      id,
+      async () => {
+        await api.rejectProjectProposal(id)
+      },
+      'Mención descartada',
+    )
   }
 
   const handleApproveAll = async () => {
@@ -500,13 +563,19 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
     }
     setBusyAll(true)
     setError(null)
+    const batch = [...proposals]
+    for (const p of batch) proposalInFlightRef.current.add(p.id)
+    setProposals([])
     let ok = 0
     let failed = 0
+    const failedItems: EntityProposalView[] = []
     try {
-      for (const p of proposals) {
+      for (const p of batch) {
         const title = (draftTitles[p.id] ?? p.suggested_name).trim()
         if (!title) {
           failed += 1
+          failedItems.push(p)
+          proposalInFlightRef.current.delete(p.id)
           continue
         }
         try {
@@ -529,9 +598,14 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
           ok += 1
         } catch {
           failed += 1
+          failedItems.push(p)
+        } finally {
+          proposalInFlightRef.current.delete(p.id)
         }
       }
-      await load()
+      if (failedItems.length > 0) {
+        setProposals((prev) => [...failedItems, ...prev])
+      }
       onChanged?.()
       setStatusMsg(
         failed > 0
@@ -586,7 +660,157 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
   }
 
   return (
-    <div className="entity-stage personas-stage">
+    <div className={embedded ? 'entity-stage-body' : 'entity-stage personas-stage'}>
+      <section className="panel entity-panel entity-pending">
+        <div className="panel-head entity-head">
+          <div>
+            <h2>
+              Validador NER
+              {proposals.length > 0 ? (
+                <span className="nav-badge">{proposals.length}</span>
+              ) : null}
+            </h2>
+            <p className="muted mono">
+              Menciones nuevas (audio / criba) · acá llegan las del badge
+            </p>
+          </div>
+          <div className="entity-head-actions">
+            {proposals.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-primary btn-tiny"
+                onClick={() => {
+                  setValidatorOpen(true)
+                  setDeckOpen(true)
+                }}
+              >
+                Validación
+              </button>
+            )}
+            {validatorOpen && proposals.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-primary btn-tiny"
+                disabled={busyAll}
+                onClick={() => void handleApproveAll()}
+              >
+                Aprobar todo
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn-tiny btn-ghost"
+              onClick={() => setValidatorOpen((o) => !o)}
+            >
+              {validatorOpen ? 'Plegar' : 'Abrir'}
+            </button>
+          </div>
+        </div>
+
+        {validatorOpen &&
+          (proposals.length === 0 ? (
+            <p className="muted mono">Sin menciones pendientes</p>
+          ) : (
+            <ul className="proposal-list">
+              {proposals.map((p) => {
+                const match = p.suggested_match
+                const busy = busyId === p.id || busyAll
+                return (
+                  <li key={p.id} className="proposal-card">
+                    <div className="proposal-card-head">
+                      <span
+                        className={
+                          match ? 'badge badge-link' : 'badge badge-new'
+                        }
+                      >
+                        {match ? 'Posible vínculo' : 'Mención'}
+                      </span>
+                    </div>
+                    <label className="field">
+                      <span className="mono">Título</span>
+                      <input
+                        value={draftTitles[p.id] ?? p.suggested_name}
+                        onChange={(e) =>
+                          setDraftTitles((d) => ({
+                            ...d,
+                            [p.id]: e.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="field">
+                      <span className="mono">Tipo</span>
+                      <select
+                        value={draftCategories[p.id] ?? 'proyecto'}
+                        onChange={(e) =>
+                          setDraftCategories((d) => ({
+                            ...d,
+                            [p.id]: e.target.value as ProjectKind,
+                          }))
+                        }
+                      >
+                        <option value="proyecto">Proyecto</option>
+                        <option value="tarea">Tarea / reto</option>
+                        <option value="concepto">Concepto</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span className="mono">Estado</span>
+                      <select
+                        value={draftStatuses[p.id] ?? 'emergente'}
+                        onChange={(e) =>
+                          setDraftStatuses((d) => ({
+                            ...d,
+                            [p.id]: e.target.value as ProjectStatus,
+                          }))
+                        }
+                      >
+                        <option value="activo">Activo</option>
+                        <option value="pausado">Pausado</option>
+                        <option value="cerrado">Cerrado</option>
+                        <option value="emergente">Emergente</option>
+                      </select>
+                    </label>
+                    {p.evidence_parsed.snippet && (
+                      <p className="proposal-evidence">
+                        “{p.evidence_parsed.snippet}”
+                      </p>
+                    )}
+                    {match && profiles.some((x) => x.id === match.id) && (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-tiny"
+                        disabled={busy}
+                        onClick={() => void handleLinkProposal(p, match.id)}
+                      >
+                        Vincular a {match.name}
+                      </button>
+                    )}
+                    <div className="actions-row proposal-actions">
+                      <button
+                        type="button"
+                        className="btn btn-tiny btn-ghost danger"
+                        disabled={busy}
+                        onClick={() => void handleReject(p.id)}
+                      >
+                        Descartar
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-tiny"
+                        disabled={busy}
+                        onClick={() => void handleCreateNew(p)}
+                      >
+                        A sala de espera
+                      </button>
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          ))}
+      </section>
+
       <div className="personas-layout">
         <section className="panel entity-panel profiles-directory">
           <div className="panel-head entity-head">
@@ -660,7 +884,7 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
                     type="search"
                     value={semanticQuery}
                     onChange={(e) => setSemanticQuery(e.target.value)}
-                    placeholder="Búsqueda semántica…"
+                    placeholder="Buscar por título o alias…"
                   />
                   {semanticBusy && (
                     <span className="semantic-search-hint mono">…</span>
@@ -748,7 +972,7 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
               {filteredProfiles.length === 0 && (
                 <p className="muted mono">
                   {semanticQuery.trim()
-                    ? 'Sin coincidencias semánticas'
+                    ? 'Sin coincidencias'
                     : 'Nada en este filtro'}
                 </p>
               )}
@@ -1160,142 +1384,40 @@ export function ProjectsSection({ refreshKey, onChanged }: Props) {
         </div>
       </div>
 
-      <section className="panel entity-panel entity-pending">
-        <div className="panel-head entity-head">
-          <div>
-            <h2>Validador NER</h2>
-            <p className="muted mono">
-              Menciones nuevas post-audio
-              {proposals.length > 0 ? ` · ${proposals.length}` : ''}
-            </p>
-          </div>
-          <div className="entity-head-actions">
-            {validatorOpen && proposals.length > 0 && (
-              <button
-                type="button"
-                className="btn btn-primary btn-tiny"
-                disabled={busyAll}
-                onClick={() => void handleApproveAll()}
-              >
-                Aprobar todo
-              </button>
-            )}
-            <button
-              type="button"
-              className="btn btn-tiny btn-ghost"
-              onClick={() => setValidatorOpen((o) => !o)}
-            >
-              {validatorOpen ? 'Plegar' : 'Abrir'}
-            </button>
-          </div>
-        </div>
-
-        {validatorOpen &&
-          (proposals.length === 0 ? (
-            <p className="muted mono">Sin menciones pendientes</p>
-          ) : (
-            <ul className="proposal-list">
-              {proposals.map((p) => {
-                const match = p.suggested_match
-                const busy = busyId === p.id || busyAll
-                return (
-                  <li key={p.id} className="proposal-card">
-                    <div className="proposal-card-head">
-                      <span
-                        className={
-                          match ? 'badge badge-link' : 'badge badge-new'
-                        }
-                      >
-                        {match ? 'Posible vínculo' : 'Mención'}
-                      </span>
-                    </div>
-                    <label className="field">
-                      <span className="mono">Título</span>
-                      <input
-                        value={draftTitles[p.id] ?? p.suggested_name}
-                        onChange={(e) =>
-                          setDraftTitles((d) => ({
-                            ...d,
-                            [p.id]: e.target.value,
-                          }))
-                        }
-                      />
-                    </label>
-                    <label className="field">
-                      <span className="mono">Tipo</span>
-                      <select
-                        value={draftCategories[p.id] ?? 'proyecto'}
-                        onChange={(e) =>
-                          setDraftCategories((d) => ({
-                            ...d,
-                            [p.id]: e.target.value as ProjectKind,
-                          }))
-                        }
-                      >
-                        <option value="proyecto">Proyecto</option>
-                        <option value="tarea">Tarea / reto</option>
-                        <option value="concepto">Concepto</option>
-                      </select>
-                    </label>
-                    <label className="field">
-                      <span className="mono">Estado</span>
-                      <select
-                        value={draftStatuses[p.id] ?? 'emergente'}
-                        onChange={(e) =>
-                          setDraftStatuses((d) => ({
-                            ...d,
-                            [p.id]: e.target.value as ProjectStatus,
-                          }))
-                        }
-                      >
-                        <option value="activo">Activo</option>
-                        <option value="pausado">Pausado</option>
-                        <option value="cerrado">Cerrado</option>
-                        <option value="emergente">Emergente</option>
-                      </select>
-                    </label>
-                    {p.evidence_parsed.snippet && (
-                      <p className="proposal-evidence">
-                        “{p.evidence_parsed.snippet}”
-                      </p>
-                    )}
-                    {match && profiles.some((x) => x.id === match.id) && (
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-tiny"
-                        disabled={busy}
-                        onClick={() => void handleLinkProposal(p, match.id)}
-                      >
-                        Vincular a {match.name}
-                      </button>
-                    )}
-                    <div className="actions-row proposal-actions">
-                      <button
-                        type="button"
-                        className="btn btn-tiny btn-ghost danger"
-                        disabled={busy}
-                        onClick={() => void handleReject(p.id)}
-                      >
-                        Descartar
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-tiny"
-                        disabled={busy}
-                        onClick={() => void handleCreateNew(p)}
-                      >
-                        A sala de espera
-                      </button>
-                    </div>
-                  </li>
-                )
-              })}
-            </ul>
-          ))}
-      </section>
-
       {statusMsg && <p className="status-line ok">{statusMsg}</p>}
       {error && <p className="status-line err">{error}</p>}
+
+      <NerValidationDeck
+        open={deckOpen}
+        onClose={() => setDeckOpen(false)}
+        variant="project"
+        proposals={proposals}
+        names={draftTitles}
+        classes={draftCategories}
+        classOptions={[
+          { value: 'proyecto', label: 'Proyecto' },
+          { value: 'tarea', label: 'Tarea / reto' },
+          { value: 'concepto', label: 'Concepto' },
+        ]}
+        onNameChange={(id, value) =>
+          setDraftTitles((d) => ({ ...d, [id]: value }))
+        }
+        onClassChange={(id, value) =>
+          setDraftCategories((d) => ({
+            ...d,
+            [id]: normalizeProjectKind(value),
+          }))
+        }
+        onDiscard={async (p) => {
+          await handleReject(p.id)
+        }}
+        onWaiting={async (p) => {
+          await handleCreateNew(p)
+        }}
+        onLink={async (p, targetId) => {
+          await handleLinkProposal(p, targetId)
+        }}
+      />
     </div>
   )
 }

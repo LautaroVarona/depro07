@@ -26,11 +26,16 @@ graphRouter.get('/search', async (req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q : ''
   const limitRaw =
     typeof req.query.limit === 'string' ? Number(req.query.limit) : 12
+  const modeRaw =
+    typeof req.query.mode === 'string' ? req.query.mode.toLowerCase() : 'lexical'
+  const mode =
+    modeRaw === 'semantic' || modeRaw === 'hybrid' ? modeRaw : 'lexical'
   const results = await searchGraphNodes(
     q,
     Number.isFinite(limitRaw) ? limitRaw : 12,
+    { mode },
   )
-  res.json({ query: q, results })
+  res.json({ query: q, results, mode })
 })
 
 graphRouter.get('/discover', (req, res) => {
